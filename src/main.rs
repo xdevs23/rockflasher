@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::fs::{metadata, OpenOptions};
+use std::fs::{File, metadata, OpenOptions};
+use std::io;
 use std::io::{copy, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -26,6 +27,12 @@ const LBA_SIZE: u64 = match LBA {
 const PART_ALIGNMENT: u64 = 1 * 1024 * 1024;
 const FIRST_PART_ALIGNMENT: u64 = 8 * 1024 * 1024;
 
+// https://opensource.rock-chips.com/wiki_Boot_option#The_Pre-bootloader.28IDBLoader.29
+const IDBLOADER_ALIGNMENT_LBA: u64 = 0x40;
+const IDBLOADER_ALIGNMENT: u64 = 0x40 * LBA_SIZE;
+
+const IDBLOADER_PARTNAME: &'static str = "idbloader";
+
 /// Simple program to greet a person
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -45,6 +52,10 @@ struct Args {
     /// Image file size (only if destination is not a device)
     #[arg(short, long, default_value="0")]
     size: String,
+
+    /// Path to IDBloader
+    #[arg(short, long)]
+    idbloader: Option<PathBuf>
 }
 
 fn check_args(opt: &Args) -> Result<(), String> {
@@ -165,7 +176,7 @@ fn main() -> Result<(), String> {
     let partitions = parse_partitions(&opt)?;
     let partitions = reorder_partitions(partitions);
 
-    flash(opt.destination, size, partitions)?;
+    flash(opt.destination.clone(), size, partitions, opt.idbloader)?;
 
     Ok(())
 }
@@ -173,7 +184,8 @@ fn main() -> Result<(), String> {
 fn flash(
     destination: PathBuf,
     size: u64,
-    partitions: Vec<PartitionDefinition>
+    partitions: Vec<PartitionDefinition>,
+    idbloader: Option<PathBuf>,
 ) -> Result<(), String> {
     let (size, is_block_device) = match is_block_device(destination.clone()) {
         Ok(true) => match get_device_size(destination.clone()) {
@@ -198,7 +210,7 @@ fn flash(
     }
 
     let created_partitions =
-        create_partition_table(destination.clone(), partitions)?;
+        create_partition_table(destination.clone(), partitions, idbloader)?;
 
     write_images(destination, created_partitions)?;
 
@@ -207,16 +219,48 @@ fn flash(
     Ok(())
 }
 
+fn open_write_sync(path: PathBuf) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true).write(true)
+        .custom_flags(
+            if cfg!(unix) {
+                libc::O_SYNC
+            } else {
+                0
+            }
+        )
+        .open(path)
+}
+
+fn create_protective_mbr(path: PathBuf) -> Result<(), String> {
+    let mut file = open_write_sync(path.clone())
+        .map_err(|err| format!("Could not open file: {}", err))?;
+
+    let device_size = get_device_size(path.clone()).unwrap();
+
+    let mbr = gpt::mbr::ProtectiveMBR::with_lb_size(
+        u32::try_from((device_size / LBA_SIZE) - 1).unwrap_or(0xFF_FF_FF_FF));
+    mbr.overwrite_lba0(&mut file)
+        .map_err(|err| format!("Failed to write MBR to {}: {}", path.to_str().unwrap(), err))?;
+
+    Ok(())
+}
+
 fn create_partition_table(
     destination: PathBuf,
-    partitions: Vec<PartitionDefinition>
+    partitions: Vec<PartitionDefinition>,
+    idbloader: Option<PathBuf>,
 ) -> Result<Vec<CreatedPartition>, String> {
     let mut created_partitions = vec![];
+
+    eprintln!("Creating protective MBR…");
+    create_protective_mbr(destination.clone())?;
 
     let cfg = gpt::GptConfig::new()
         .initialized(false)
         .writable(true)
         .logical_block_size(LBA);
+
 
     eprintln!("Opening {}…", destination.to_str().unwrap());
     let mut disk = cfg.open(destination.clone())
@@ -229,6 +273,44 @@ fn create_partition_table(
     disk.update_partitions(BTreeMap::<u32, Partition>::new())
         .map_err(|err| format!("Failed to clear partition table: {}", err))?;
 
+    if let Some(idbloader) = idbloader {
+        let loader_size = metadata(idbloader.clone())
+            .map_err(|err| format!(
+                "Failed to get metadata for file {}: {}",
+                idbloader.to_str().unwrap(), err
+            ))
+            .and_then(|source_metadata|
+                Ok(align_up(source_metadata.len(), IDBLOADER_ALIGNMENT))
+            )?;
+        eprintln!(
+            "Adding partition for pre-bootloader, size {}",
+            BinarySize::from(loader_size).rounded()
+        );
+        let part_id = disk.add_partition(
+            IDBLOADER_PARTNAME,
+            loader_size,
+            partition_types::ANDROID_BOOTLOADER,
+            0,
+            Some(IDBLOADER_ALIGNMENT_LBA)
+        ).map_err(|err| format!(
+            "Could not add pre-bootloader partition, size {}: {}",
+            BinarySize::from(loader_size).rounded(), err
+        ))?;
+
+        let partition = disk.partitions().get(&part_id)
+            .ok_or(format!("Can't find created partition with ID {}", part_id))?;
+
+        created_partitions.push(
+            CreatedPartition {
+                def: Some(PartitionDefinition {
+                    partition_name: IDBLOADER_PARTNAME.into(),
+                    source_file: Some(idbloader.clone()),
+                    size: loader_size,
+                }),
+                partition: partition.clone(),
+            }
+        );
+    }
 
     for (index, partition_def) in partitions.iter().enumerate() {
         let part_alignment = if index == 0 { FIRST_PART_ALIGNMENT } else { PART_ALIGNMENT };
@@ -258,7 +340,7 @@ fn create_partition_table(
                 def: Some(partition_def.clone()),
                 partition: partition.clone(),
             }
-        )
+        );
     }
 
     let has_created_userdata = partitions.iter()
@@ -290,7 +372,7 @@ fn create_partition_table(
                     def: None,
                     partition: partition.clone(),
                 }
-            )
+            );
         }
     }
 
@@ -342,6 +424,7 @@ fn erase_beginning(path: impl AsRef<Path>) -> Result<(), String> {
     file.write_at(vec![0_u8; FIRST_PART_ALIGNMENT as usize].as_slice(), 0)
         .map_err(|err| format!("Failed to erase beginning of disk: {}", err))?;
 
+    sp.message("Erased beginning of disk".into());
     sp.close();
     Ok(())
 }
@@ -463,9 +546,10 @@ fn write_images(
             }
 
             sp.message(format!(
-                "Successfully wrote {} ({})",
-               partition.partition.name, BinarySize::from(def.size).rounded())
-            );
+                "Successfully wrote {} ({} at {:#x})",
+                partition.partition.name, BinarySize::from(def.size).rounded(),
+                partition_start,
+            ));
         } else {
             sp.message(format!("Cleared {}, nothing else to do.", partition.partition.name));
         }
