@@ -405,18 +405,9 @@ fn create_sparse_file(path: impl AsRef<Path>, size: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn erase_beginning(path: impl AsRef<Path>) -> Result<(), String> {
+fn erase_beginning(path: PathBuf) -> Result<(), String> {
     let sp = SpinnerBuilder::new("Erasing beginning of disk".into()).start();
-    let file = OpenOptions::new()
-        .read(true).write(true)
-        .custom_flags(
-            if cfg!(unix) {
-                libc::O_SYNC
-            } else {
-                0
-            }
-        )
-        .open(path)
+    let file = open_write_sync(path)
         .map_err(|err| format!("Could not open file: {}", err))?;
 
 
