@@ -17,7 +17,8 @@ as an userdata partition that fills the rest of the available space.
 
 ```
 sudo target/release/rockflasher \
-    --partition boot:boot.img \
+    --idbloader idbloader.img \
+    --partition boot:u-boot.itb \
     --partition dtbo:dtbo.img \
     --partition misc:misc.img \
     --partition recovery:recovery.img \
