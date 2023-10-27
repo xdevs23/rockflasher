@@ -10,11 +10,10 @@ use gpt::disk::LogicalBlockSize;
 use gpt::partition::Partition;
 use gpt::partition_types;
 use parse_size::parse_size;
+use sizes::BinarySize;
 use spinner::SpinnerBuilder;
 use crate::alignment::align_up;
-use crate::sizes::BinarySize;
 
-pub mod sizes;
 pub mod alignment;
 
 const LBA: LogicalBlockSize = LogicalBlockSize::Lb512;
