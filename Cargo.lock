@@ -354,7 +354,6 @@ dependencies = [
  "parse-size",
  "sizes",
  "spinner",
- "uuid",
 ]
 
 [[package]]
