@@ -29,6 +29,9 @@ sudo target/release/rockflasher \
     --partition vbmeta:vbmeta.img \
     --blank-partition cache:384MiB \
     --blank-partition metadata:16MiB \
+    --format-partition cache:ext4 \
+    --format-partition userdata:ext4 \
+    --format-partition metadata:ext4 \
     --destination /dev/sdX
 ```
 
