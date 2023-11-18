@@ -4,6 +4,7 @@ use std::io;
 use std::io::{copy, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use block_utils::{BlockResult, get_device_info, is_block_device};
 use clap::Parser;
 use gpt::disk::LogicalBlockSize;
@@ -48,6 +49,10 @@ struct Args {
     #[arg(short, long)]
     destination: PathBuf,
 
+    /// Format partition (use in combination with --blank-partition)
+    #[arg(short, long)]
+    format_partition: Vec<String>,
+
     /// Image file size (only if destination is not a device)
     #[arg(short, long, default_value="0")]
     size: String,
@@ -81,6 +86,12 @@ struct PartitionDefinition {
     partition_name: String,
     source_file: Option<PathBuf>,
     size: u64,
+}
+
+#[derive(Clone, Debug)]
+struct FormatPartitionDefinition {
+    partition_name: String,
+    format_as: String,
 }
 
 #[derive(Clone, Debug)]
@@ -136,6 +147,17 @@ fn parse_empty_partition(part_arg: &String) -> Result<PartitionDefinition, Strin
     })
 }
 
+fn parse_format_partition(part_arg: &String) -> Result<FormatPartitionDefinition, String> {
+    let split = match part_arg.split_once(":") {
+        None => Err(format!("Invalid partition argument (missing fs): {}", part_arg)),
+        Some(split) => Ok(split)
+    }?;
+    let partition_name = split.0.into();
+    let format_as = split.1.into();
+
+    Ok(FormatPartitionDefinition { partition_name, format_as })
+}
+
 fn parse_partitions(opt: &Args) -> Result<Vec<PartitionDefinition>, String> {
     opt.partition.iter()
         .map(|part_arg| parse_partition(part_arg))
@@ -143,6 +165,12 @@ fn parse_partitions(opt: &Args) -> Result<Vec<PartitionDefinition>, String> {
             opt.blank_partition.iter()
                 .map(|part_arg| parse_empty_partition(part_arg))
         )
+        .collect()
+}
+
+fn parse_format_partitions(opt: &Args) -> Result<Vec<FormatPartitionDefinition>, String> {
+    opt.format_partition.iter()
+        .map(|part_arg| parse_format_partition(part_arg))
         .collect()
 }
 
@@ -174,8 +202,10 @@ fn main() -> Result<(), String> {
 
     let partitions = parse_partitions(&opt)?;
     let partitions = reorder_partitions(partitions);
+    let partitions_to_format = parse_format_partitions(&opt)?;
 
     flash(opt.destination.clone(), size, partitions, opt.idbloader)?;
+    format_partitions(opt.destination.clone(), partitions_to_format)?;
 
     Ok(())
 }
@@ -186,6 +216,11 @@ fn flash(
     partitions: Vec<PartitionDefinition>,
     idbloader: Option<PathBuf>,
 ) -> Result<(), String> {
+    if partitions.is_empty() && idbloader.is_none() {
+        eprintln!("No partitions specified, nothing to flash, skipping.");
+        return Ok(())
+    }
+
     let (size, is_block_device) = match is_block_device(destination.clone()) {
         Ok(true) => match get_device_size(destination.clone()) {
             Ok(size) => Ok((size, true)),
@@ -547,6 +582,95 @@ fn write_images(
     }
 
     eprintln!("Finished writing all partitions");
+
+    Ok(())
+}
+
+fn format_partitions(
+    destination: PathBuf,
+    partitions_to_format: Vec<FormatPartitionDefinition>
+) -> Result<(), String>  {
+    if partitions_to_format.is_empty() {
+        return Ok(())
+    }
+    if !cfg!(target_os = "linux") {
+        return Err(format!("Creating filesystems is unsupported on {}", cfg!(target_os)));
+    }
+
+    eprintln!("Probing partitions");
+    let output = Command::new("partprobe")
+        .output()
+        .or_else(|e| {
+            eprintln!("Failed to run partprobe: {}", e);
+            Err(e)
+        })
+        .ok();
+    if let Some(output) = output {
+        if !output.status.success() {
+            eprintln!(
+                "WARNING: partprobe failed:\n{}\n{}",
+                String::from_utf8_lossy(output.stdout.as_slice()),
+                String::from_utf8_lossy(output.stderr.as_slice())
+            )
+        }
+    }
+
+    eprintln!("Starting format, partition count: {}", partitions_to_format.len());
+
+    let cfg = gpt::GptConfig::new()
+        .initialized(true)
+        .writable(false)
+        .logical_block_size(LBA);
+
+    eprintln!("Opening {}…", destination.to_str().unwrap());
+    let disk = cfg.open(destination.clone())
+        .map_err(|err| format!(
+            "Failed to open file {} for reading partition table: {}",
+            destination.to_str().unwrap(), err
+        ))?;
+
+    for partition_to_format in partitions_to_format {
+        let (_, gpt_part) = disk.partitions().iter().find(
+            |(_, part)| part.name == partition_to_format.partition_name
+        ).ok_or_else(|| format!(
+            "Could not find partition {} to format as {}",
+            partition_to_format.partition_name, partition_to_format.format_as
+        ))?;
+        let part_uuid = gpt_part.part_guid;
+        eprintln!(
+            "Formatting {} as {} (PARTUUID={})",
+            gpt_part.name,
+            partition_to_format.format_as,
+            part_uuid
+        );
+        let output = Command::new(format!("mkfs.{}", partition_to_format.format_as))
+            .arg(format!("/dev/disk/by-partuuid/{}", part_uuid.to_string()))
+            .output()
+            .map_err(|e| format!(
+                "Failed to run mkfs.{} on partition {} (PARTUUID={}): {}",
+                partition_to_format.format_as,
+                gpt_part.name,
+                part_uuid.to_string(),
+                e
+            ))?;
+        if !output.status.success() {
+            eprintln!(
+                "mkfs.{} exited with status code {}. Output:",
+                partition_to_format.format_as,
+                output.status.code().unwrap_or(-1)
+            );
+            eprintln!("{}", String::from_utf8_lossy(output.stdout.as_slice()));
+            eprintln!("{}", String::from_utf8_lossy(output.stderr.as_slice()));
+            return Err(format!(
+                "Failed to format partition {} (PARTUUID={}) using mkfs.{}:\n{}\n{}",
+                gpt_part.name,
+                part_uuid.to_string(),
+                partition_to_format.format_as,
+                String::from_utf8_lossy(output.stdout.as_slice()),
+                String::from_utf8_lossy(output.stderr.as_slice()),
+            ))
+        }
+    }
 
     Ok(())
 }
