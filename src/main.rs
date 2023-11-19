@@ -461,8 +461,8 @@ fn partition_name_to_type(name: String) -> partition_types::Type {
         "system" | "vendor" | "super" | "product" | "odm" => partition_types::ANDROID_SYSTEM,
         "cache" => partition_types::ANDROID_CACHE,
         "userdata" => partition_types::ANDROID_DATA,
-        "boot" | "vendor_boot" | "system_dlkm" | "vendor_dlkm" |
-        "dtb" | "dtbo" | "vbmeta" | "security" => partition_types::ANDROID_BOOT,
+        "boot" | "vendor_boot" | "system_dlkm" | "vendor_dlkm" | "odm_dlkm" |
+        "dtb" | "dtbo" | "vbmeta" | "security" | "init_boot" => partition_types::ANDROID_BOOT,
         "recovery" => partition_types::ANDROID_RECOVERY,
         "misc" => partition_types::ANDROID_MISC,
         "metadata" => partition_types::ANDROID_META,
