@@ -456,20 +456,21 @@ fn erase_beginning(path: PathBuf) -> Result<(), String> {
 
 fn partition_name_to_type(name: String) -> partition_types::Type {
     match name.as_str() {
-        "system" | "vendor" | "super" | "root" => partition_types::ANDROID_SYSTEM,
+        "system" | "vendor" | "super" | "product" | "odm" => partition_types::ANDROID_SYSTEM,
         "cache" => partition_types::ANDROID_CACHE,
-        "userdata" | "data" => partition_types::ANDROID_DATA,
-        "boot" | "dtb" | "dtbo" | "vbmeta" | "security" => partition_types::ANDROID_BOOT,
+        "userdata" => partition_types::ANDROID_DATA,
+        "boot" | "vendor_boot" | "system_dlkm" | "vendor_dlkm" |
+        "dtb" | "dtbo" | "vbmeta" | "security" => partition_types::ANDROID_BOOT,
         "recovery" => partition_types::ANDROID_RECOVERY,
         "misc" => partition_types::ANDROID_MISC,
-        "meta" | "metadata" => partition_types::ANDROID_META,
+        "metadata" => partition_types::ANDROID_META,
         "factory" | "backup" => partition_types::ANDROID_FACTORY,
-        "uboot" | "bootloader" | "loader" | "trust" =>
+        "uboot" | "bootloader" | "loader" | "trust" | "idbloader" =>
             partition_types::ANDROID_BOOTLOADER,
         "stage2" | "bootloader2" | "loader2" => partition_types::ANDROID_BOOTLOADER2,
         "fastboot" => partition_types::ANDROID_FASTBOOT,
         "oem" => partition_types::ANDROID_OEM,
-        "persist" | "persistent" => partition_types::ANDROID_PERSISTENT,
+        "persist" => partition_types::ANDROID_PERSISTENT,
         _ => partition_types::BASIC
     }
 }
