@@ -5,6 +5,8 @@ use std::io::{copy, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread::sleep;
+use std::time::Duration;
 use block_utils::{BlockResult, get_device_info, is_block_device};
 use clap::Parser;
 use gpt::disk::LogicalBlockSize;
@@ -644,8 +646,13 @@ fn format_partitions(
             partition_to_format.format_as,
             part_uuid
         );
+        let device = format!("/dev/disk/by-partuuid/{}", part_uuid.to_string());
+        wait_for_device(
+            PathBuf::from(device.clone()),
+            20, Duration::from_millis(250)
+        )?;
         let output = Command::new(format!("mkfs.{}", partition_to_format.format_as))
-            .arg(format!("/dev/disk/by-partuuid/{}", part_uuid.to_string()))
+            .arg(device)
             .output()
             .map_err(|e| format!(
                 "Failed to run mkfs.{} on partition {} (PARTUUID={}): {}",
@@ -673,5 +680,24 @@ fn format_partitions(
         }
     }
 
+    Ok(())
+}
+
+fn wait_for_device(device: PathBuf, retries: u32, retry_interval: Duration) -> Result<(), String> {
+    let mut tried = 0;
+    while !(device.exists() && (device.is_file() || device.is_symlink())) {
+        if retries == tried {
+            return Err(format!(
+                "Timed out waiting for device {}, retries: {}",
+                device.to_string_lossy(),
+                tried
+            ))
+        }
+        if tried == 0 {
+            eprintln!("Waiting for device {}…", device.to_string_lossy())
+        }
+        tried += 1;
+        sleep(retry_interval)
+    }
     Ok(())
 }
