@@ -35,7 +35,6 @@ const IDBLOADER_ALIGNMENT: u64 = 0x40 * LBA_SIZE;
 
 const IDBLOADER_PARTNAME: &'static str = "idbloader";
 
-/// Simple program to greet a person
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {

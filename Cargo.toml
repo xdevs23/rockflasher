@@ -2,6 +2,7 @@
 name = "rockflasher"
 version = "0.1.0"
 edition = "2021"
+description = "Partition and write SD cards and eMMC for Rockchip boards"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
