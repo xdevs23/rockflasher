@@ -1,19 +1,24 @@
 {
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-24.11";
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
   };
 
-  outputs = { nixpkgs,  ... }:
-  let forEachSystem = nixpkgs.lib.genAttrs nixpkgs.lib.systems.flakeExposed;
+  outputs = { self, nixpkgs }:
+  let
+    inherit (nixpkgs) lib;
+    linuxSystems = lib.filter (system: (lib.systems.elaborate system).isLinux) lib.systems.flakeExposed;
+    forEachSystem = f: lib.genAttrs linuxSystems (system: f nixpkgs.legacyPackages.${system});
   in {
-    devShell = forEachSystem (system:
-      let pkgs = import nixpkgs { inherit system; };
-      in pkgs.mkShell {
-        buildInputs = with pkgs; [
-          cargo rustc pkg-config openssl openssl.dev
-        ];
-        RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
-      }
-    );
+    packages = forEachSystem (pkgs: {
+      default = pkgs.callPackage ./package.nix { };
+    });
+
+    devShells = forEachSystem (pkgs: {
+      default = pkgs.mkShell {
+        inputsFrom = [ self.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+        packages = [ pkgs.clippy ];
+        RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+      };
+    });
   };
 }

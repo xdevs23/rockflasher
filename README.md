@@ -1,6 +1,6 @@
 # rockflasher
 A tool for flashing emmc/microSD cards for use with Rockchip boards.
-This is meant to be used after building AOSP, but can also be used to install u-boot without anything else.
+It writes AOSP builds, U-Boot on its own or Linux systems, to a card or to an image file.
 
 ## Usage
 
@@ -41,19 +41,52 @@ sudo target/release/rockflasher \
 sudo target/release/rockflasher --idbloader idbloader.img --partition uboot:u-boot.itb --destination /dev/sdX
 ```
 
-#### Install some Linux OS
-
-Note that this tool is currently not meant to be used for anything other than installing AOSP or U-Boot so the usefulness will be limited.
+#### Install a Linux system
 
 ```
 sudo target/release/rockflasher \
     --idbloader idbloader.img \
     --partition uboot:u-boot.itb \
-    --partition boot:boot.img \
-    --partition super:rootfs.img \
-    --blank-partition swap:2GiB \
+    --partition esp:esp.raw \
+    --partition-type esp:esp \
+    --partition-uuid esp:ea41e62a-2a38-46c9-bb9d-3e0f807c338f \
+    --partition main:main.raw \
+    --partition-type main:linux \
+    --no-fill \
     --destination /dev/sdX
 ```
+
+#### Install a Linux system from systemd-repart output
+
+Run systemd-repart with `--split=yes` and `--json=short`, save its output, and pass that file with `--repart`:
+
+```
+sudo target/release/rockflasher \
+    --idbloader idbloader.img \
+    --partition uboot:u-boot.itb \
+    --repart repart.json \
+    --no-fill \
+    --destination /dev/sdX
+```
+
+Each partition in the file becomes a partition named by its label, with its type, its UUID and its size.
+Its split file is written into it. A partition without a split file is created without contents.
+A relative split file path is read from the directory of the JSON file.
+Its type is read like a `--partition-type` value.
+The partitions of `--repart` come after those of `--partition` and `--blank-partition`, and loader partitions still come first.
+
+The idbloader starts at sector 64 (32 KiB).
+The first partition starts at 8 MiB, and loader partitions (`uboot`, `bootloader`, `loader`, `trust`) come first, so `--partition uboot:u-boot.itb` places U-Boot at 8 MiB.
+Every other partition starts at the end of the partition before it, rounded up to 1 MiB.
+
+The partition name is the GPT partition name.
+`--partition-type name:type` sets the GPT type: `linux`, a systemd-repart type name (`esp`, `xbootldr`, `linux-generic`, `swap`, `home`, `srv`, `root-x86`, `root-x86-64`, `root-arm`, `root-arm64`), a type name of the gpt crate (such as `linux_fs`) or a type GUID.
+`--partition-uuid name:uuid` sets the partition UUID.
+
+`--no-fill` leaves the space after the last partition free. Without it, a userdata partition fills that space.
+With `--no-fill`, an image file as `--destination` needs no `--size`: it gets the size of its partitions.
+
+Writing to a block device fails before anything is written while a partition on it is mounted or otherwise in use.
 
 ## License
 
