@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use uuid::Uuid;
 use crate::layout::LayoutRequest;
+use crate::repart;
 use crate::values::{ByteSize, Filesystem, PartitionSetting, PartitionType};
 
 #[derive(Parser, Debug)]
@@ -22,6 +23,10 @@ pub struct Args {
     /// Add an empty partition (name:size)
     #[arg(short, long)]
     pub blank_partition: Vec<PartitionSetting<ByteSize>>,
+
+    /// Add the partitions listed in the JSON output of systemd-repart (--json=short or pretty), each named by its label, with its type, UUID and size, and its split file as contents
+    #[arg(long)]
+    pub repart: Option<PathBuf>,
 
     /// Disk or image file to write to
     #[arg(short, long)]
@@ -45,14 +50,15 @@ pub struct Args {
 }
 
 impl Args {
-    pub fn layout_request(&self) -> LayoutRequest {
-        LayoutRequest {
+    pub fn layout_request(&self) -> Result<LayoutRequest, String> {
+        Ok(LayoutRequest {
             idbloader: self.idbloader.clone(),
             file_partitions: self.partition.clone(),
             blank_partitions: self.blank_partition.clone(),
+            repart_partitions: self.repart.as_deref().map_or(Ok(Vec::new()), repart::read_partitions)?,
             types: self.partition_type.clone(),
             uuids: self.partition_uuid.clone(),
             fill_userdata: !self.no_fill,
-        }
+        })
     }
 }

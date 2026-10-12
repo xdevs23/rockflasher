@@ -56,6 +56,25 @@ sudo target/release/rockflasher \
     --destination /dev/sdX
 ```
 
+#### Install a Linux system from systemd-repart output
+
+Run systemd-repart with `--split=yes` and `--json=short`, save its output, and pass that file with `--repart`:
+
+```
+sudo target/release/rockflasher \
+    --idbloader idbloader.img \
+    --partition uboot:u-boot.itb \
+    --repart repart.json \
+    --no-fill \
+    --destination /dev/sdX
+```
+
+Each partition in the file becomes a partition named by its label, with its type, its UUID and its size.
+Its split file is written into it. A partition without a split file is created without contents.
+A relative split file path is read from the directory of the JSON file.
+Its type is read like a `--partition-type` value.
+The partitions of `--repart` come after those of `--partition` and `--blank-partition`, and loader partitions still come first.
+
 The idbloader starts at sector 64 (32 KiB).
 The first partition starts at 8 MiB, and loader partitions (`uboot`, `bootloader`, `loader`, `trust`) come first, so `--partition uboot:u-boot.itb` places U-Boot at 8 MiB.
 Every other partition starts at the end of the partition before it, rounded up to 1 MiB.

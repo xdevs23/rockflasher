@@ -108,6 +108,7 @@ pub struct LayoutRequest {
     pub idbloader: Option<PathBuf>,
     pub file_partitions: Vec<PartitionSetting<PathBuf>>,
     pub blank_partitions: Vec<PartitionSetting<ByteSize>>,
+    pub repart_partitions: Vec<PartitionDefinition>,
     pub types: Vec<PartitionSetting<PartitionType>>,
     pub uuids: Vec<PartitionSetting<Uuid>>,
     pub fill_userdata: bool,
@@ -149,6 +150,7 @@ impl Layout {
         );
         let partitions: Vec<_> = files.chain(blanks).collect::<Result<Vec<_>, String>>()?
             .into_iter()
+            .chain(request.repart_partitions)
             .map(|def| def.with_settings(settings))
             .collect();
 
@@ -211,7 +213,7 @@ fn check_settings<T>(
         if !partitions.iter().any(|def| def.partition_name == setting.partition_name) {
             return Err(format!(
                 "A partition {} is set for {}, which is not in the layout. \
-                Set it for a file partition, a blank partition or {}.",
+                Set it for a file partition, a blank partition, a systemd-repart partition or {}.",
                 setting_kind, setting.partition_name, IDBLOADER_PARTNAME
             ))
         }

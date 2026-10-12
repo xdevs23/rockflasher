@@ -8,11 +8,12 @@ mod destination;
 mod disk;
 mod format;
 mod layout;
+mod repart;
 mod values;
 
 fn main() -> Result<(), String> {
     let opt = Args::parse();
-    let layout = Layout::new(opt.layout_request())?;
+    let layout = Layout::new(opt.layout_request()?)?;
     let destination = Destination::resolve(&opt.destination, opt.size)?;
 
     disk::flash(&destination, &layout)?;
