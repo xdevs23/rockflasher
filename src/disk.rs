@@ -316,3 +316,116 @@ fn write_images(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixtures::{layout, ScratchDir};
+
+    fn flash_fitted_image(scratch: &ScratchDir, options: &[&str]) -> GptDisk<File> {
+        let image = scratch.path().join("disk.img");
+        let layout = layout(options).unwrap();
+        flash(&Destination::ImageFile { path: image.clone(), size: None }, &layout).unwrap();
+        gpt::GptConfig::new().logical_block_size(LBA).open(&image).unwrap()
+    }
+
+    fn assert_fitted(disk: &GptDisk<File>) {
+        let header = disk.header();
+        let last_lba = disk.partitions().values().map(|partition| partition.last_lba).max();
+        assert_eq!(last_lba, Some(header.last_usable));
+        assert!(disk.backup_header().is_ok());
+        let image_size = disk.device_ref().metadata().unwrap().len();
+        assert_eq!(image_size, (header.backup_lba + 1) * LBA_SIZE);
+    }
+
+    #[test]
+    fn image_file_ends_with_the_backup_table_after_the_last_partition() {
+        let scratch = ScratchDir::new("disk-fitted");
+        let disk = flash_fitted_image(&scratch, &[
+            "--blank-partition", "a:1000",
+            "--blank-partition", "b:3MiB",
+            "--no-fill",
+        ]);
+        assert_fitted(&disk);
+    }
+
+    #[test]
+    fn image_file_with_idbloader_keeps_the_loader_offsets() {
+        let scratch = ScratchDir::new("disk-fitted-idbloader");
+        let idbloader = scratch.file("idbloader.img", 200 * 1024);
+        let uboot = scratch.file("u-boot.itb", 1024 * 1024);
+        let disk = flash_fitted_image(&scratch, &[
+            "--idbloader", &idbloader.display().to_string(),
+            "--blank-partition", "main:5MiB",
+            "--partition", &format!("uboot:{}", uboot.display()),
+            "--no-fill",
+        ]);
+        assert_fitted(&disk);
+        let start_of = |name: &str| disk.partitions().values()
+            .find(|partition| partition.name == name)
+            .map(|partition| partition.first_lba * LBA_SIZE);
+        assert_eq!(start_of("idbloader"), Some(32 * 1024));
+        assert_eq!(start_of("uboot"), Some(8 * 1024 * 1024));
+        assert_eq!(start_of("main"), Some(16 * 1024 * 1024));
+    }
+
+    #[test]
+    fn image_file_that_does_not_fit_is_removed() {
+        let scratch = ScratchDir::new("disk-fitted-removed");
+        let image = scratch.path().join("disk.img");
+        let mut layout = layout(&["--blank-partition", "a:1MiB", "--no-fill"]).unwrap();
+        layout.partitions[0].size = u64::try_from(i64::MAX).unwrap();
+        assert!(flash(&Destination::ImageFile { path: image.clone(), size: None }, &layout).is_err());
+        assert!(!image.exists());
+    }
+
+    #[test]
+    fn flash_writes_each_source_at_its_partition_start_and_zeros_after_it() {
+        let scratch = ScratchDir::new("disk-contents");
+        let idbloader = scratch.patterned_file("idbloader.img", 200 * 1024, 1);
+        let uboot = scratch.patterned_file("u-boot.itb", 1000 * 1024, 2);
+        let esp = scratch.patterned_file("disk.img.esp", 3 * 1024 * 1024 + 512, 3);
+        let repart = scratch.path().join("repart.json");
+        let partitions = serde_json::json!([
+            { "type": "esp", "label": "esp", "uuid": "8f3c2a6e-4b1d-4e7a-9c05-d2b7e1f04a93",
+              "raw_size": 8 * 1024 * 1024, "split_path": "disk.img.esp" },
+            { "type": "linux-generic", "label": "var", "uuid": "0b6e3c52-1d8f-4a27-b9e4-6f1c2d3a4b5c",
+              "raw_size": 2 * 1024 * 1024, "split_path": "-" },
+        ]);
+        std::fs::write(&repart, partitions.to_string()).unwrap();
+        let image = scratch.path().join("disk.img");
+        let layout = layout(&[
+            "--idbloader", &idbloader.display().to_string(),
+            "--partition", &format!("uboot:{}", uboot.display()),
+            "--repart", &repart.display().to_string(),
+            "--no-fill",
+        ]).unwrap();
+
+        flash(&Destination::ImageFile { path: image.clone(), size: None }, &layout).unwrap();
+
+        let disk = gpt::GptConfig::new().logical_block_size(LBA).open(&image).unwrap();
+        let contents = std::fs::read(&image).unwrap();
+        let sources = [
+            ("idbloader", Some(idbloader)),
+            ("uboot", Some(uboot)),
+            ("esp", Some(esp)),
+            ("var", None),
+        ];
+        for (name, source) in sources {
+            let partition = disk.partitions().values().find(|partition| partition.name == name).unwrap();
+            let start = usize::try_from(partition.first_lba * LBA_SIZE).unwrap();
+            let end = usize::try_from((partition.last_lba + 1) * LBA_SIZE).unwrap();
+            let source = source.map(|source| std::fs::read(source).unwrap()).unwrap_or_default();
+            let (written, rest) = contents[start..end].split_at(source.len());
+            assert!(written == source, "contents of {name}");
+            assert!(rest.iter().all(|&byte| byte == 0), "zeros after the contents of {name}");
+        }
+    }
+
+    #[test]
+    fn image_file_without_size_needs_no_fill() {
+        let scratch = ScratchDir::new("disk-fill");
+        let image = scratch.path().join("disk.img");
+        let layout = layout(&["--blank-partition", "a:1MiB"]).unwrap();
+        assert!(flash(&Destination::ImageFile { path: image, size: None }, &layout).is_err());
+    }
+}

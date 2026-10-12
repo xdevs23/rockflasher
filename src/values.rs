@@ -102,3 +102,62 @@ impl<T: FromStr> FromStr for PartitionSetting<T> where T::Err: Display {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use uuid::Uuid;
+    use super::*;
+
+    #[test]
+    fn setting_splits_at_the_first_colon() {
+        let setting: PartitionSetting<PathBuf> = "boot:images/a:b.img".parse().unwrap();
+        assert_eq!(setting.partition_name, "boot");
+        assert_eq!(setting.value, PathBuf::from("images/a:b.img"));
+    }
+
+    #[test]
+    fn setting_parses_its_value() {
+        let setting: PartitionSetting<ByteSize> = "cache:384MiB".parse().unwrap();
+        assert_eq!(setting.partition_name, "cache");
+        assert_eq!(setting.value.bytes(), 384 * 1024 * 1024);
+    }
+
+    #[test]
+    fn setting_without_colon_is_refused() {
+        assert!("cache".parse::<PartitionSetting<ByteSize>>().is_err());
+    }
+
+    #[test]
+    fn setting_with_invalid_value_is_refused() {
+        assert!("esp:not-a-uuid".parse::<PartitionSetting<Uuid>>().is_err());
+        assert!("cache:12XB".parse::<PartitionSetting<ByteSize>>().is_err());
+    }
+
+    #[test]
+    fn size_of_zero_is_refused() {
+        assert!("0".parse::<ByteSize>().is_err());
+        assert!("0MiB".parse::<ByteSize>().is_err());
+    }
+
+    #[test]
+    fn filesystem_is_a_name_of_letters_and_digits() {
+        assert_eq!("ext4".parse::<Filesystem>().unwrap().mkfs_program(), "mkfs.ext4");
+        assert!("".parse::<Filesystem>().is_err());
+        assert!("../ext4".parse::<Filesystem>().is_err());
+        assert!("ext4 -F".parse::<Filesystem>().is_err());
+    }
+
+    #[test]
+    fn partition_type_reads_table_names_crate_names_and_guids() {
+        assert_eq!("esp".parse::<PartitionType>().unwrap().0, partition_types::EFI);
+        assert_eq!("linux".parse::<PartitionType>().unwrap().0, partition_types::LINUX_FS);
+        assert_eq!("linux-generic".parse::<PartitionType>().unwrap().0, partition_types::LINUX_FS);
+        assert_eq!("root-arm64".parse::<PartitionType>().unwrap().0, partition_types::LINUX_ROOT_ARM_64);
+        assert_eq!("linux_swap".parse::<PartitionType>().unwrap().0, partition_types::LINUX_SWAP);
+        assert_eq!(
+            "C12A7328-F81F-11D2-BA4B-00A0C93EC93B".parse::<PartitionType>().unwrap().0,
+            partition_types::EFI
+        );
+        assert!("no-such-type".parse::<PartitionType>().unwrap_err().contains("is not supported"));
+    }
+}

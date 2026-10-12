@@ -290,3 +290,166 @@ fn partition_name_to_type(name: &str) -> partition_types::Type {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixtures::{layout, ScratchDir};
+
+    const UUID: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
+    const MIB: u64 = 1024 * 1024;
+
+    fn names(partitions: &[PartitionDefinition]) -> Vec<&str> {
+        partitions.iter().map(|def| def.partition_name.as_str()).collect()
+    }
+
+    #[test]
+    fn loaders_come_first_whatever_their_type() {
+        let layout = layout(&[
+            "--blank-partition", "a:1MiB",
+            "--blank-partition", "uboot:1MiB",
+            "--partition-type", "uboot:linux",
+        ]).unwrap();
+        assert_eq!(names(&layout.partitions), ["uboot", "a"]);
+        assert_eq!(layout.partitions[0].part_type, partition_types::LINUX_FS);
+    }
+
+    #[test]
+    fn type_follows_the_name_unless_set() {
+        let layout = layout(&[
+            "--blank-partition", "cache:1MiB",
+            "--blank-partition", "esp:1MiB",
+            "--partition-type", "esp:esp",
+        ]).unwrap();
+        assert_eq!(layout.partitions[0].part_type, partition_types::ANDROID_CACHE);
+        assert_eq!(layout.partitions[1].part_type, partition_types::EFI);
+    }
+
+    #[test]
+    fn each_partition_starts_after_the_one_before_it() {
+        let scratch = ScratchDir::new("layout-place");
+        let idbloader = scratch.file("idbloader.img", 200 * 1024);
+        let uboot = scratch.file("u-boot.itb", 1024 * 1024);
+        let layout = layout(&[
+            "--idbloader", &idbloader.display().to_string(),
+            "--blank-partition", "small:4MiB",
+            "--blank-partition", "odd:1000",
+            "--blank-partition", "last:1MiB",
+            "--partition", &format!("uboot:{}", uboot.display()),
+        ]).unwrap();
+        let placements = layout.place(17 * 1024..64 * MIB).unwrap();
+        let starts: Vec<_> = placements.iter()
+            .map(|placement| (placement.def.partition_name.as_str(), placement.start, placement.end()))
+            .collect();
+        assert_eq!(starts, [
+            ("idbloader", 32 * 1024, 32 * 1024 + 224 * 1024),
+            ("uboot", 8 * MIB, 16 * MIB),
+            ("small", 16 * MIB, 20 * MIB),
+            ("odd", 20 * MIB, 20 * MIB + 1024),
+            ("last", 21 * MIB, 22 * MIB),
+            ("userdata", 22 * MIB, 64 * MIB),
+        ]);
+    }
+
+    #[test]
+    fn first_partition_starts_at_8_mib_without_idbloader() {
+        let layout = layout(&["--blank-partition", "a:1MiB", "--no-fill"]).unwrap();
+        let placements = layout.place(17 * 1024..64 * MIB).unwrap();
+        assert_eq!(placements[0].start, 8 * MIB);
+    }
+
+    #[test]
+    fn partition_past_the_usable_space_is_refused() {
+        let layout = layout(&["--blank-partition", "a:1MiB", "--no-fill"]).unwrap();
+        assert!(layout.place(17 * 1024..9 * MIB - 1).is_err());
+    }
+
+    #[test]
+    fn userdata_fills_the_disk_unless_given_or_no_fill() {
+        let fill = |options: &[&str]| layout(options).unwrap().fill_userdata;
+        assert!(fill(&["--blank-partition", "a:1MiB"]));
+        assert!(!fill(&["--blank-partition", "a:1MiB", "--no-fill"]));
+        assert!(!fill(&["--blank-partition", "userdata:1MiB", "--partition-type", "userdata:linux"]));
+    }
+
+    #[test]
+    fn setting_for_an_unknown_partition_is_refused() {
+        let result = layout(&["--blank-partition", "a:1MiB", "--partition-type", "b:linux"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn setting_given_twice_is_refused() {
+        let result = layout(&[
+            "--blank-partition", "a:1MiB",
+            "--partition-type", "a:linux",
+            "--partition-type", "a:esp",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn one_name_on_two_partitions_is_refused() {
+        let scratch = ScratchDir::new("layout-names");
+        let idbloader = scratch.file("idbloader.img", 1000);
+        let repart = scratch.path().join("repart.json");
+        let esp = serde_json::json!({ "type": "esp", "label": "esp", "uuid": UUID, "raw_size": 4096 });
+        std::fs::write(&repart, serde_json::Value::from([esp]).to_string()).unwrap();
+        let idbloader = idbloader.display().to_string();
+        let repart = repart.display().to_string();
+        let refused = |options: &[&str]| layout(options).err().is_some_and(|err| err.contains("Two partitions are named"));
+        assert!(refused(&["--blank-partition", "a:1MiB", "--blank-partition", "a:2MiB"]));
+        assert!(refused(&["--partition", &format!("a:{idbloader}"), "--blank-partition", "a:1MiB"]));
+        assert!(refused(&["--repart", &repart, "--blank-partition", "esp:1MiB"]));
+        assert!(refused(&["--idbloader", &idbloader, "--blank-partition", "idbloader:1MiB"]));
+    }
+
+    #[test]
+    fn one_uuid_on_two_partitions_is_refused() {
+        let result = layout(&[
+            "--blank-partition", "a:1MiB",
+            "--blank-partition", "b:1MiB",
+            "--partition-uuid", &format!("a:{UUID}"),
+            "--partition-uuid", &format!("b:{UUID}"),
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn idbloader_takes_settings() {
+        let scratch = ScratchDir::new("layout-idbloader");
+        let idbloader = scratch.file("idbloader.img", 1000);
+        let layout = layout(&[
+            "--idbloader", &idbloader.display().to_string(),
+            "--partition-type", "idbloader:linux",
+            "--partition-uuid", &format!("idbloader:{UUID}"),
+        ]).unwrap();
+        let idbloader = layout.idbloader.unwrap();
+        assert_eq!(idbloader.part_type, partition_types::LINUX_FS);
+        assert_eq!(idbloader.part_guid, Some(UUID.parse().unwrap()));
+    }
+
+    #[test]
+    fn repart_partitions_follow_the_loaders_and_take_settings() {
+        let scratch = ScratchDir::new("layout-repart");
+        let uboot = scratch.file("u-boot.itb", 1000);
+        let repart = scratch.path().join("repart.json");
+        let esp = serde_json::json!({ "type": "esp", "label": "ESP", "uuid": UUID, "raw_size": 4096 });
+        std::fs::write(&repart, serde_json::Value::from([esp]).to_string()).unwrap();
+        let layout = layout(&[
+            "--repart", &repart.display().to_string(),
+            "--blank-partition", "a:1MiB",
+            "--partition", &format!("uboot:{}", uboot.display()),
+            "--partition-type", "ESP:linux",
+        ]).unwrap();
+        assert_eq!(names(&layout.partitions), ["uboot", "a", "ESP"]);
+        assert_eq!(layout.partitions[2].part_type, partition_types::LINUX_FS);
+        assert_eq!(layout.partitions[2].part_guid, Some(UUID.parse().unwrap()));
+    }
+
+    #[test]
+    fn empty_source_file_is_refused() {
+        let scratch = ScratchDir::new("layout-empty");
+        let empty = scratch.file("empty.img", 0);
+        assert!(layout(&["--partition", &format!("a:{}", empty.display())]).is_err());
+    }
+}

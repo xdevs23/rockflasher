@@ -38,3 +38,28 @@ impl Destination {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixtures::ScratchDir;
+
+    #[test]
+    fn directory_is_refused() {
+        let scratch = ScratchDir::new("destination-directory");
+        assert!(Destination::resolve(scratch.path(), None).is_err());
+    }
+
+    #[test]
+    fn missing_path_is_an_image_file() {
+        let scratch = ScratchDir::new("destination-missing");
+        let path = scratch.path().join("disk.img");
+        assert!(matches!(Destination::resolve(&path, None), Ok(Destination::ImageFile { .. })));
+    }
+
+    #[test]
+    fn regular_file_is_an_image_file() {
+        let scratch = ScratchDir::new("destination-file");
+        let path = scratch.file("disk.img", 1024);
+        assert!(matches!(Destination::resolve(&path, None), Ok(Destination::ImageFile { .. })));
+    }
+}

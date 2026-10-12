@@ -6,6 +6,8 @@ use crate::layout::Layout;
 mod cli;
 mod destination;
 mod disk;
+#[cfg(test)]
+mod fixtures;
 mod format;
 mod layout;
 mod repart;
