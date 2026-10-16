@@ -48,11 +48,7 @@ pub fn flash(destination: &Destination, layout: &Layout) -> Result<(), String> {
         BinarySize::from(size).rounded()
     );
 
-    if let Destination::BlockDevice(device) = destination {
-        erase_beginning(device)?;
-    }
-
-    let created_partitions = create_partition_table(destination.path(), size, layout)?;
+    let created_partitions = create_partition_table(destination, size, layout)?;
 
     write_images(destination, created_partitions)?;
 
@@ -78,12 +74,13 @@ fn create_protective_mbr(path: &Path, device_size: u64) -> Result<(), String> {
 }
 
 fn create_partition_table(
-    destination: &Path,
+    destination: &Destination,
     size: u64,
     layout: &Layout,
 ) -> Result<Vec<CreatedPartition>, String> {
-    eprintln!("Opening {}…", destination.display());
-    let (disk, created_partitions) = lay_out_partitions(destination, layout)?;
+    let path = destination.path();
+    eprintln!("Opening {}…", path.display());
+    let (disk, created_partitions) = lay_out_partitions(path, layout)?;
 
     for created in &created_partitions {
         eprintln!(
@@ -93,8 +90,12 @@ fn create_partition_table(
         );
     }
 
+    if let Destination::BlockDevice(device) = destination {
+        erase_beginning(device)?;
+    }
+
     eprintln!("Creating protective MBR…");
-    create_protective_mbr(destination, size)?;
+    create_protective_mbr(path, size)?;
 
     eprintln!("Writing partition table…");
     disk.write().map_err(|err| format!("Failed to write partition table: {err}"))?;
