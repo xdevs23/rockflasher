@@ -2,6 +2,7 @@
 name = "rockflasher"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Partition and write SD cards and eMMC for Rockchip boards, and SD cards for MediaTek MT7988 boards"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
