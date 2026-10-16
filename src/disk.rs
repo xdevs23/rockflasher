@@ -6,11 +6,11 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use gpt::GptDisk;
 use gpt::header::Header;
-use gpt::partition::Partition;
+use gpt::partition::{Partition, PartitionAttributes};
 use sizes::BinarySize;
 use uuid::Uuid;
 use crate::destination::Destination;
-use crate::layout::{Layout, PartitionDefinition, Placement, FIRST_PART_ALIGNMENT, LBA, LBA_SIZE};
+use crate::layout::{GptAttributes, Layout, PartitionDefinition, Placement, FIRST_PART_ALIGNMENT, LBA, LBA_SIZE};
 use crate::values::ByteSize;
 
 const CLEAR_BYTES: [u8; 1024] = [0; 1024];
@@ -148,7 +148,7 @@ fn add_partition(disk: &mut GptDisk<File>, placement: Placement) -> Result<Creat
         sectors.start,
         sectors.end - sectors.start,
         def.part_type.clone(),
-        0,
+        PartitionAttributes::from(def.attributes).bits(),
     ).map_err(|err| format!(
         "Could not add partition {}, size {}: {}",
         def.partition_name, BinarySize::from(def.size).rounded(), err
@@ -166,6 +166,15 @@ fn add_partition(disk: &mut GptDisk<File>, placement: Placement) -> Result<Creat
     let partition = disk.partitions().get(&part_id).cloned()
         .ok_or(format!("Can't find created partition with ID {part_id}"))?;
     Ok(CreatedPartition { def, partition })
+}
+
+impl From<GptAttributes> for PartitionAttributes {
+    fn from(attributes: GptAttributes) -> Self {
+        let mut flags = Self::empty();
+        flags.set(Self::PLATFORM, attributes.required);
+        flags.set(Self::BOOTABLE, attributes.legacy_bios_bootable);
+        flags
+    }
 }
 
 fn create_fitted_image(path: &Path, layout: &Layout) -> Result<u64, String> {
@@ -384,6 +393,28 @@ mod tests {
         let disk = flash_fitted_image(&scratch, &["--blank-partition", "a:1MiB", "--disk-uuid", guid, "--no-fill"]);
         assert_eq!(*disk.guid(), guid.parse::<Uuid>().unwrap());
         assert_eq!(disk.backup_header().unwrap().disk_guid, *disk.guid());
+    }
+
+    #[test]
+    fn partition_attributes_are_written_to_the_gpt() {
+        let scratch = ScratchDir::new("disk-attributes");
+        let image = scratch.path().join("disk.img");
+        let mut layout = layout(&[
+            "--blank-partition", "a:1MiB",
+            "--blank-partition", "b:1MiB",
+            "--blank-partition", "c:1MiB",
+            "--no-fill",
+        ]).unwrap();
+        layout.partitions[1].attributes = GptAttributes { required: true, legacy_bios_bootable: true };
+        layout.partitions[2].attributes = GptAttributes { required: true, legacy_bios_bootable: false };
+
+        flash(&Destination::ImageFile { path: image.clone(), size: None }, &layout).unwrap();
+
+        let disk = gpt::GptConfig::new().logical_block_size(LBA).open(&image).unwrap();
+        let flags: Vec<_> = disk.partitions().values().map(|partition| (partition.name.as_str(), partition.flags)).collect();
+        let required = PartitionAttributes::PLATFORM.bits();
+        let legacy_bios_bootable = PartitionAttributes::BOOTABLE.bits();
+        assert_eq!(flags, [("a", 0), ("b", required | legacy_bios_bootable), ("c", required)]);
     }
 
     #[test]

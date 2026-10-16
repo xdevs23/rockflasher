@@ -58,6 +58,12 @@ impl SourceFile {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GptAttributes {
+    pub required: bool,
+    pub legacy_bios_bootable: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct PartitionDefinition {
     pub partition_name: String,
@@ -65,6 +71,7 @@ pub struct PartitionDefinition {
     pub size: u64,
     pub part_type: partition_types::Type,
     pub part_guid: Option<Uuid>,
+    pub attributes: GptAttributes,
 }
 
 impl PartitionDefinition {
@@ -81,6 +88,7 @@ impl PartitionDefinition {
             size,
             part_type,
             part_guid,
+            attributes: GptAttributes::default(),
         }
     }
 
