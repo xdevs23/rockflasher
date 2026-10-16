@@ -3,6 +3,7 @@ use crate::cli::Args;
 use crate::destination::Destination;
 use crate::layout::Layout;
 
+mod boards;
 mod cli;
 mod destination;
 mod disk;
@@ -11,6 +12,7 @@ mod fixtures;
 mod format;
 mod layout;
 mod repart;
+mod rockchip;
 mod values;
 
 fn main() -> Result<(), String> {

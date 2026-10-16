@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use clap::Parser;
 use uuid::Uuid;
+use crate::boards::Boards;
 use crate::layout::LayoutRequest;
 use crate::repart;
 use crate::values::{ByteSize, Filesystem, PartitionSetting, PartitionType};
@@ -40,9 +41,8 @@ pub struct Args {
     #[arg(short, long)]
     pub size: Option<ByteSize>,
 
-    /// Path to the idbloader image, written to a partition at sector 64 (32 KiB)
-    #[arg(short, long)]
-    pub idbloader: Option<PathBuf>,
+    #[command(flatten)]
+    boards: Boards,
 
     /// Leave the space after the last partition free instead of adding a userdata partition
     #[arg(long)]
@@ -52,7 +52,7 @@ pub struct Args {
 impl Args {
     pub fn layout_request(&self) -> Result<LayoutRequest, String> {
         Ok(LayoutRequest {
-            idbloader: self.idbloader.clone(),
+            board_partitions: self.boards.partitions()?,
             file_partitions: self.partition.clone(),
             blank_partitions: self.blank_partition.clone(),
             repart_partitions: self.repart.as_deref().map_or(Ok(Vec::new()), repart::read_partitions)?,

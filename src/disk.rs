@@ -168,7 +168,7 @@ fn add_partition(disk: &mut GptDisk<File>, placement: Placement) -> Result<Creat
 }
 
 fn create_fitted_image(path: &Path, layout: &Layout) -> Result<u64, String> {
-    let upper_bound = layout.idbloader.iter().chain(&layout.partitions)
+    let upper_bound = layout.definitions()
         .map(|def| def.size + FIRST_PART_ALIGNMENT)
         .sum::<u64>() + FIRST_PART_ALIGNMENT;
     create_sparse_file(path, upper_bound)
