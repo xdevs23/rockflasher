@@ -17,7 +17,7 @@ pub const LBA_SIZE: u64 = match LBA {
 pub const KIB: u64 = 1024;
 pub const MIB: u64 = 1024 * KIB;
 
-const PART_ALIGNMENT: u64 = MIB;
+pub const PART_ALIGNMENT: u64 = MIB;
 pub const FIRST_PART_ALIGNMENT: u64 = 8 * MIB;
 
 const USERDATA_PARTNAME: &str = "userdata";
@@ -109,6 +109,10 @@ impl PartitionDefinition {
         let source = SourceFile::read(partition_name, source_file)?;
         let size = source.len.next_multiple_of(size_alignment);
         Ok(Self::new(partition_name, Some(source), size, part_type, None))
+    }
+
+    pub fn with_attributes(self, attributes: GptAttributes) -> Self {
+        Self { attributes, ..self }
     }
 
     fn userdata(size: u64) -> Self {

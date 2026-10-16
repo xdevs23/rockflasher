@@ -4,9 +4,12 @@ use clap::Parser;
 use crate::cli::Args;
 use crate::layout::Layout;
 
+pub fn parse(options: &[&str]) -> Result<Args, clap::Error> {
+    Args::try_parse_from(["rockflasher", "--destination", "disk.img"].iter().chain(options))
+}
+
 pub fn layout(options: &[&str]) -> Result<Layout, String> {
-    let args = Args::try_parse_from(["rockflasher", "--destination", "disk.img"].iter().chain(options)).unwrap();
-    Layout::new(args.layout_request()?)
+    Layout::new(parse(options).unwrap().layout_request()?)
 }
 
 pub struct ScratchDir(PathBuf);

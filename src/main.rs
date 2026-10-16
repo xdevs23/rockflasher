@@ -11,6 +11,7 @@ mod disk;
 mod fixtures;
 mod format;
 mod layout;
+mod mt7988;
 mod repart;
 mod rockchip;
 mod values;

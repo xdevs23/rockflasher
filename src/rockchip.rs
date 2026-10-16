@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 use gpt::partition_types;
+use crate::boards::Board;
 use crate::layout::{PartitionDefinition, Placement, KIB, LBA_SIZE};
 
 // https://opensource.rock-chips.com/wiki_Boot_option#The_Pre-bootloader.28IDBLoader.29
@@ -13,14 +14,14 @@ const IDBLOADER_PARTNAME: &str = "idbloader";
 pub struct Options {
     // Without this, clap requires the argument even when the optional group is absent.
     #[arg(short, long, required = false, help = format!(
-        "Path to the idbloader image of a Rockchip board, written to a partition at sector {} ({} KiB)",
+        "Path to the idbloader image for a Rockchip board, written to a partition at sector {} ({} KiB)",
         IDBLOADER_START / LBA_SIZE, IDBLOADER_START / KIB
     ))]
     idbloader: PathBuf,
 }
 
-impl Options {
-    pub fn board_partitions(&self) -> Result<Vec<Placement>, String> {
+impl Board for Options {
+    fn partitions(&self) -> Result<Vec<Placement>, String> {
         let def = PartitionDefinition::from_file(
             IDBLOADER_PARTNAME, &self.idbloader, partition_types::ANDROID_BOOTLOADER, IDBLOADER_SIZE_ALIGNMENT
         )?;
