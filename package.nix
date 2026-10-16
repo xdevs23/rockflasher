@@ -13,7 +13,7 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ./Cargo.lock;
   meta = {
     inherit (cargoPackage) description;
-    license = lib.licenses.mit;
+    license = lib.getLicenseFromSpdxId cargoPackage.license;
     mainProgram = "rockflasher";
   };
 }

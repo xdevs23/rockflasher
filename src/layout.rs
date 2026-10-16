@@ -1,4 +1,5 @@
 use std::fs::metadata;
+use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use gpt::disk::LogicalBlockSize;
@@ -13,14 +14,12 @@ pub const LBA_SIZE: u64 = match LBA {
     LogicalBlockSize::Lb4096 => 4096
 };
 
-const PART_ALIGNMENT: u64 = 1024 * 1024;
-pub const FIRST_PART_ALIGNMENT: u64 = 8 * 1024 * 1024;
+pub const KIB: u64 = 1024;
+pub const MIB: u64 = 1024 * KIB;
 
-// https://opensource.rock-chips.com/wiki_Boot_option#The_Pre-bootloader.28IDBLoader.29
-const IDBLOADER_ALIGNMENT_LBA: u64 = 0x40;
-const IDBLOADER_ALIGNMENT: u64 = IDBLOADER_ALIGNMENT_LBA * LBA_SIZE;
+pub const PART_ALIGNMENT: u64 = MIB;
+pub const FIRST_PART_ALIGNMENT: u64 = 8 * MIB;
 
-const IDBLOADER_PARTNAME: &str = "idbloader";
 const USERDATA_PARTNAME: &str = "userdata";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +32,7 @@ enum Role {
 impl Role {
     fn for_name(partition_name: &str) -> Self {
         match partition_name {
-            "uboot" | "bootloader" | "loader" | "trust" | IDBLOADER_PARTNAME => Role::Loader,
+            "uboot" | "bootloader" | "loader" | "trust" => Role::Loader,
             USERDATA_PARTNAME => Role::Userdata,
             _ => Role::Other,
         }
@@ -41,28 +40,55 @@ impl Role {
 }
 
 #[derive(Clone, Debug)]
+pub struct SourceFile {
+    pub path: PathBuf,
+    pub len: u64,
+}
+
+impl SourceFile {
+    pub fn stat(path: &Path) -> io::Result<Self> {
+        metadata(path).map(|source_metadata| Self { path: path.into(), len: source_metadata.len() })
+    }
+
+    pub fn read(partition_name: &str, path: &Path) -> Result<Self, String> {
+        Self::stat(path).map_err(|err| format!(
+            "Could not read source file {} for partition {}: {}. Check the path.",
+            path.display(), partition_name, err
+        ))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GptAttributes {
+    pub required: bool,
+    pub legacy_bios_bootable: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct PartitionDefinition {
     pub partition_name: String,
-    pub source_file: Option<PathBuf>,
+    pub source: Option<SourceFile>,
     pub size: u64,
     pub part_type: partition_types::Type,
     pub part_guid: Option<Uuid>,
+    pub attributes: GptAttributes,
 }
 
 impl PartitionDefinition {
     pub fn new(
         partition_name: &str,
-        source_file: Option<PathBuf>,
+        source: Option<SourceFile>,
         size: u64,
         part_type: partition_types::Type,
         part_guid: Option<Uuid>,
     ) -> Self {
         Self {
             partition_name: partition_name.into(),
-            source_file,
+            source,
             size,
             part_type,
             part_guid,
+            attributes: GptAttributes::default(),
         }
     }
 
@@ -70,18 +96,23 @@ impl PartitionDefinition {
         Role::for_name(&self.partition_name)
     }
 
-    fn named(partition_name: &str, source_file: Option<PathBuf>, size: u64) -> Self {
-        Self::new(partition_name, source_file, size, partition_name_to_type(partition_name), None)
+    fn named(partition_name: &str, source: Option<SourceFile>, size: u64) -> Self {
+        Self::new(partition_name, source, size, partition_name_to_type(partition_name), None)
     }
 
-    fn from_file(partition_name: &str, source_file: &Path, alignment: u64) -> Result<Self, String> {
-        let size = metadata(source_file)
-            .map(|source_metadata| source_metadata.len().next_multiple_of(alignment))
-            .map_err(|err| format!(
-                "Could not read source file {} of partition {}: {}. Check the path.",
-                source_file.display(), partition_name, err
-            ))?;
-        Ok(Self::named(partition_name, Some(source_file.into()), size))
+    pub fn from_file(
+        partition_name: &str,
+        source_file: &Path,
+        part_type: partition_types::Type,
+        size_alignment: u64,
+    ) -> Result<Self, String> {
+        let source = SourceFile::read(partition_name, source_file)?;
+        let size = source.len.next_multiple_of(size_alignment);
+        Ok(Self::new(partition_name, Some(source), size, part_type, None))
+    }
+
+    pub fn with_attributes(self, attributes: GptAttributes) -> Self {
+        Self { attributes, ..self }
     }
 
     fn userdata(size: u64) -> Self {
@@ -105,21 +136,25 @@ struct Settings<'a> {
 }
 
 pub struct LayoutRequest {
-    pub idbloader: Option<PathBuf>,
+    pub board_partitions: Vec<Placement>,
     pub file_partitions: Vec<PartitionSetting<PathBuf>>,
     pub blank_partitions: Vec<PartitionSetting<ByteSize>>,
     pub repart_partitions: Vec<PartitionDefinition>,
     pub types: Vec<PartitionSetting<PartitionType>>,
     pub uuids: Vec<PartitionSetting<Uuid>>,
+    pub disk_guid: Option<Uuid>,
     pub fill_userdata: bool,
 }
 
 pub struct Layout {
-    pub idbloader: Option<PartitionDefinition>,
+    /// Partitions at the places where the boot chain of a board reads them, in the order of their starts.
+    pub board_partitions: Vec<Placement>,
     pub partitions: Vec<PartitionDefinition>,
+    pub disk_guid: Option<Uuid>,
     pub fill_userdata: bool,
 }
 
+#[derive(Clone, Debug)]
 pub struct Placement {
     pub def: PartitionDefinition,
     pub start: u64,
@@ -133,18 +168,21 @@ impl Placement {
     pub fn sectors(&self) -> Range<u64> {
         self.start / LBA_SIZE..self.end() / LBA_SIZE
     }
+
+    fn with_settings(self, settings: Settings) -> Self {
+        Self { def: self.def.with_settings(settings), ..self }
+    }
 }
 
 impl Layout {
     pub fn new(request: LayoutRequest) -> Result<Self, String> {
         let settings = Settings { types: &request.types, uuids: &request.uuids };
-        let idbloader = request.idbloader.as_deref()
-            .map(|idbloader| PartitionDefinition::from_file(IDBLOADER_PARTNAME, idbloader, IDBLOADER_ALIGNMENT))
-            .transpose()?
-            .map(|idbloader| idbloader.with_settings(settings));
-        let files = request.file_partitions.iter().map(|setting|
-            PartitionDefinition::from_file(&setting.partition_name, &setting.value, FIRST_PART_ALIGNMENT)
-        );
+        let board_partitions = request.board_partitions.into_iter()
+            .map(|placement| placement.with_settings(settings))
+            .collect();
+        let files = request.file_partitions.iter().map(|setting| PartitionDefinition::from_file(
+            &setting.partition_name, &setting.value, partition_name_to_type(&setting.partition_name), FIRST_PART_ALIGNMENT
+        ));
         let blanks = request.blank_partitions.iter().map(|setting|
             Ok(PartitionDefinition::named(&setting.partition_name, None, setting.value.bytes()))
         );
@@ -154,34 +192,59 @@ impl Layout {
             .map(|def| def.with_settings(settings))
             .collect();
 
-        let definitions: Vec<_> = idbloader.iter().chain(&partitions).collect();
+        let fill_userdata = request.fill_userdata && !partitions.iter().any(|def| def.role() == Role::Userdata);
+        let layout = Self {
+            board_partitions,
+            partitions: loaders_first(partitions),
+            disk_guid: request.disk_guid,
+            fill_userdata,
+        };
+        layout.check(settings)?;
+        Ok(layout)
+    }
+
+    fn check(&self, settings: Settings) -> Result<(), String> {
+        let definitions: Vec<_> = self.definitions().collect();
         check_partition_names(&definitions)?;
         check_settings("type", settings.types, &definitions)?;
         check_settings("UUID", settings.uuids, &definitions)?;
-        check_partition_uuids(&definitions)?;
-        check_partition_sizes(&definitions)?;
-
-        let fill_userdata = request.fill_userdata && !partitions.iter().any(|def| def.role() == Role::Userdata);
-        Ok(Self { idbloader, partitions: loaders_first(partitions), fill_userdata })
+        check_uuids(self.disk_guid, &definitions)?;
+        check_source_files(&definitions)?;
+        check_legacy_bios_bootable(&definitions)?;
+        check_partition_sizes(&definitions)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.idbloader.is_none() && self.partitions.is_empty()
+        self.board_partitions.is_empty() && self.partitions.is_empty()
+    }
+
+    pub fn definitions(&self) -> impl Iterator<Item = &PartitionDefinition> {
+        self.board_partitions.iter().map(|placement| &placement.def).chain(&self.partitions)
     }
 
     pub fn place(&self, usable: Range<u64>) -> Result<Vec<Placement>, String> {
-        let idbloader = self.idbloader.iter().map(|def| (def.clone(), IDBLOADER_ALIGNMENT));
-        let partitions = self.partitions.iter().enumerate().map(|(index, def)| {
-            (def.clone(), if index == 0 { FIRST_PART_ALIGNMENT } else { PART_ALIGNMENT })
-        });
+        let next_free = |placements: &[Placement]| placements.last().map_or(usable.start, Placement::end);
         let mut placements: Vec<Placement> = Vec::new();
-        for (def, alignment) in idbloader.chain(partitions) {
-            let start = placements.last().map_or(usable.start, Placement::end).next_multiple_of(alignment);
-            placements.push(Placement { def, start });
+        for placement in &self.board_partitions {
+            let free = next_free(&placements);
+            if placement.start < free {
+                return Err(format!(
+                    "Partition {} has to start at byte {}, but the partition table or the partition before it \
+                    uses the space up to byte {}. This board layout does not fit the partition table. \
+                    Report it to the developers of rockflasher.",
+                    placement.def.partition_name, placement.start, free
+                ))
+            }
+            placements.push(placement.clone());
+        }
+        for (index, def) in self.partitions.iter().enumerate() {
+            let alignment = if index == 0 { FIRST_PART_ALIGNMENT } else { PART_ALIGNMENT };
+            let start = next_free(&placements).next_multiple_of(alignment);
+            placements.push(Placement { def: def.clone(), start });
         }
 
         if self.fill_userdata {
-            let start = placements.last().map_or(usable.start, Placement::end).next_multiple_of(PART_ALIGNMENT);
+            let start = next_free(&placements).next_multiple_of(PART_ALIGNMENT);
             if start < usable.end {
                 placements.push(Placement { def: PartitionDefinition::userdata(usable.end - start), start });
             }
@@ -212,9 +275,9 @@ fn check_settings<T>(
     for (index, setting) in settings.iter().enumerate() {
         if !partitions.iter().any(|def| def.partition_name == setting.partition_name) {
             return Err(format!(
-                "A partition {} is set for {}, which is not in the layout. \
-                Set it for a file partition, a blank partition, a systemd-repart partition or {}.",
-                setting_kind, setting.partition_name, IDBLOADER_PARTNAME
+                "A partition {0} is set for {1}, which is not in the layout. \
+                Add a partition named {1}, or set the {0} for a partition in the layout.",
+                setting_kind, setting.partition_name
             ))
         }
         if settings[..index].iter().any(|earlier| earlier.partition_name == setting.partition_name) {
@@ -239,9 +302,15 @@ fn check_partition_names(partitions: &[&PartitionDefinition]) -> Result<(), Stri
     Ok(())
 }
 
-fn check_partition_uuids(partitions: &[&PartitionDefinition]) -> Result<(), String> {
+fn check_uuids(disk_guid: Option<Uuid>, partitions: &[&PartitionDefinition]) -> Result<(), String> {
     for (index, def) in partitions.iter().enumerate() {
         let Some(part_guid) = def.part_guid else { continue };
+        if disk_guid == Some(part_guid) {
+            return Err(format!(
+                "Partition {} has the UUID {} of the disk. Give the disk and each partition its own UUID.",
+                def.partition_name, part_guid
+            ))
+        }
         if let Some(earlier) = partitions[..index].iter().find(|earlier| earlier.part_guid == Some(part_guid)) {
             return Err(format!(
                 "Partitions {} and {} have the same UUID {}. Give each partition its own UUID.",
@@ -252,10 +321,42 @@ fn check_partition_uuids(partitions: &[&PartitionDefinition]) -> Result<(), Stri
     Ok(())
 }
 
+fn check_source_files(partitions: &[&PartitionDefinition]) -> Result<(), String> {
+    for def in partitions {
+        let Some(source) = &def.source else { continue };
+        if source.len == 0 {
+            return Err(format!(
+                "Source file {} for partition {} is empty. Give partition {} a source file that is not empty.",
+                source.path.display(), def.partition_name, def.partition_name
+            ))
+        }
+        if source.len > def.size {
+            return Err(format!(
+                "Source file {} ({} bytes) is larger than partition {} ({} bytes). \
+                Give partition {} a source file of at most {} bytes.",
+                source.path.display(), source.len, def.partition_name, def.size, def.partition_name, def.size
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn check_legacy_bios_bootable(partitions: &[&PartitionDefinition]) -> Result<(), String> {
+    let mut bootable = partitions.iter().filter(|def| def.attributes.legacy_bios_bootable);
+    match (bootable.next(), bootable.next()) {
+        (Some(first), Some(second)) => Err(format!(
+            "Partitions {} and {} are both legacy BIOS bootable, and the MBR marks one partition active. \
+            Mark one of them.",
+            first.partition_name, second.partition_name
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn check_partition_sizes(partitions: &[&PartitionDefinition]) -> Result<(), String> {
     match partitions.iter().find(|def| def.size == 0) {
         Some(def) => Err(format!(
-            "Partition {} would be empty. Give it a source file that is not empty, or a size above zero.",
+            "Partition {} would be empty. Give it a size above zero.",
             def.partition_name
         )),
         None => Ok(()),
@@ -296,10 +397,15 @@ mod tests {
     use crate::fixtures::{layout, ScratchDir};
 
     const UUID: &str = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b";
-    const MIB: u64 = 1024 * 1024;
 
     fn names(partitions: &[PartitionDefinition]) -> Vec<&str> {
         partitions.iter().map(|def| def.partition_name.as_str()).collect()
+    }
+
+    fn with_board_partition(mut layout: Layout, name: &str, start: u64, size: u64) -> Layout {
+        let def = PartitionDefinition::new(name, None, size, partition_types::BASIC, None);
+        layout.board_partitions.push(Placement { def, start });
+        layout
     }
 
     #[test]
@@ -327,21 +433,20 @@ mod tests {
     #[test]
     fn each_partition_starts_after_the_one_before_it() {
         let scratch = ScratchDir::new("layout-place");
-        let idbloader = scratch.file("idbloader.img", 200 * 1024);
-        let uboot = scratch.file("u-boot.itb", 1024 * 1024);
+        let uboot = scratch.file("u-boot.itb", MIB);
         let layout = layout(&[
-            "--idbloader", &idbloader.display().to_string(),
             "--blank-partition", "small:4MiB",
             "--blank-partition", "odd:1000",
             "--blank-partition", "last:1MiB",
             "--partition", &format!("uboot:{}", uboot.display()),
         ]).unwrap();
-        let placements = layout.place(17 * 1024..64 * MIB).unwrap();
+        let layout = with_board_partition(layout, "loader", 32 * KIB, 224 * KIB);
+        let placements = layout.place(17 * KIB..64 * MIB).unwrap();
         let starts: Vec<_> = placements.iter()
             .map(|placement| (placement.def.partition_name.as_str(), placement.start, placement.end()))
             .collect();
         assert_eq!(starts, [
-            ("idbloader", 32 * 1024, 32 * 1024 + 224 * 1024),
+            ("loader", 32 * KIB, 256 * KIB),
             ("uboot", 8 * MIB, 16 * MIB),
             ("small", 16 * MIB, 20 * MIB),
             ("odd", 20 * MIB, 20 * MIB + 1024),
@@ -351,16 +456,31 @@ mod tests {
     }
 
     #[test]
+    fn board_partition_before_the_usable_space_is_refused() {
+        let layout = with_board_partition(layout(&["--no-fill"]).unwrap(), "loader", 32 * KIB, KIB);
+        let err = layout.place(64 * KIB..64 * MIB).err().unwrap();
+        assert!(err.contains("loader has to start at byte 32768"), "{err}");
+    }
+
+    #[test]
+    fn board_partition_that_overlaps_the_one_before_it_is_refused() {
+        let layout = with_board_partition(layout(&["--no-fill"]).unwrap(), "first", 32 * KIB, 64 * KIB);
+        let layout = with_board_partition(layout, "second", 64 * KIB, KIB);
+        let err = layout.place(17 * KIB..64 * MIB).err().unwrap();
+        assert!(err.contains("second has to start at byte 65536"), "{err}");
+    }
+
+    #[test]
     fn first_partition_starts_at_8_mib_without_idbloader() {
         let layout = layout(&["--blank-partition", "a:1MiB", "--no-fill"]).unwrap();
-        let placements = layout.place(17 * 1024..64 * MIB).unwrap();
+        let placements = layout.place(17 * KIB..64 * MIB).unwrap();
         assert_eq!(placements[0].start, 8 * MIB);
     }
 
     #[test]
     fn partition_past_the_usable_space_is_refused() {
         let layout = layout(&["--blank-partition", "a:1MiB", "--no-fill"]).unwrap();
-        assert!(layout.place(17 * 1024..9 * MIB - 1).is_err());
+        assert!(layout.place(17 * KIB..9 * MIB - 1).is_err());
     }
 
     #[test]
@@ -415,17 +535,13 @@ mod tests {
     }
 
     #[test]
-    fn idbloader_takes_settings() {
-        let scratch = ScratchDir::new("layout-idbloader");
-        let idbloader = scratch.file("idbloader.img", 1000);
-        let layout = layout(&[
-            "--idbloader", &idbloader.display().to_string(),
-            "--partition-type", "idbloader:linux",
-            "--partition-uuid", &format!("idbloader:{UUID}"),
-        ]).unwrap();
-        let idbloader = layout.idbloader.unwrap();
-        assert_eq!(idbloader.part_type, partition_types::LINUX_FS);
-        assert_eq!(idbloader.part_guid, Some(UUID.parse().unwrap()));
+    fn partition_uuid_equal_to_the_disk_uuid_is_refused() {
+        let err = layout(&[
+            "--blank-partition", "a:1MiB",
+            "--disk-uuid", UUID,
+            "--partition-uuid", &format!("a:{UUID}"),
+        ]).err().unwrap();
+        assert!(err.contains("Partition a has the UUID"), "{err}");
     }
 
     #[test]
@@ -450,6 +566,32 @@ mod tests {
     fn empty_source_file_is_refused() {
         let scratch = ScratchDir::new("layout-empty");
         let empty = scratch.file("empty.img", 0);
-        assert!(layout(&["--partition", &format!("a:{}", empty.display())]).is_err());
+        let err = layout(&["--partition", &format!("a:{}", empty.display())]).err().unwrap();
+        assert!(err.contains("for partition a is empty"), "{err}");
+    }
+
+    #[test]
+    fn source_file_larger_than_its_partition_is_refused() {
+        let scratch = ScratchDir::new("layout-large-source");
+        scratch.file("disk.img.esp", 8192);
+        let repart = scratch.path().join("repart.json");
+        let esp = serde_json::json!({
+            "type": "esp", "label": "ESP", "uuid": UUID, "raw_size": 4096, "split_path": "disk.img.esp",
+        });
+        std::fs::write(&repart, serde_json::Value::from([esp]).to_string()).unwrap();
+        let err = layout(&["--repart", &repart.display().to_string()]).err().unwrap();
+        assert!(err.contains("(8192 bytes) is larger than partition ESP (4096 bytes)"), "{err}");
+    }
+
+    #[test]
+    fn two_legacy_bios_bootable_partitions_are_refused() {
+        let mut layout = layout(&["--blank-partition", "a:1MiB", "--blank-partition", "b:1MiB"]).unwrap();
+        let settings = Settings { types: &[], uuids: &[] };
+        assert!(layout.check(settings).is_ok());
+        for def in &mut layout.partitions {
+            def.attributes.legacy_bios_bootable = true;
+        }
+        let err = layout.check(settings).err().unwrap();
+        assert!(err.contains("Partitions a and b are both legacy BIOS bootable"), "{err}");
     }
 }

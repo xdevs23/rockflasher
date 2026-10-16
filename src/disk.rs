@@ -6,13 +6,19 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use gpt::GptDisk;
 use gpt::header::Header;
-use gpt::partition::Partition;
+use gpt::mbr::{PartRecord, ProtectiveMBR};
+use gpt::partition::{Partition, PartitionAttributes};
 use sizes::BinarySize;
+use uuid::Uuid;
 use crate::destination::Destination;
-use crate::layout::{Layout, PartitionDefinition, Placement, FIRST_PART_ALIGNMENT, LBA, LBA_SIZE};
+use crate::layout::{GptAttributes, Layout, PartitionDefinition, Placement, FIRST_PART_ALIGNMENT, LBA, LBA_SIZE};
 use crate::values::ByteSize;
 
 const CLEAR_BYTES: [u8; 1024] = [0; 1024];
+const MBR_BOOT_INDICATOR_ACTIVE: u8 = 0x80;
+const MBR_OS_TYPE_LINUX: u8 = 0x83;
+// The entry after the protective one, which spans the whole disk, so the two entries overlap.
+const MBR_HYBRID_ENTRY: usize = 1;
 
 #[derive(Clone, Debug)]
 struct CreatedPartition {
@@ -48,11 +54,7 @@ pub fn flash(destination: &Destination, layout: &Layout) -> Result<(), String> {
         BinarySize::from(size).rounded()
     );
 
-    if let Destination::BlockDevice(device) = destination {
-        erase_beginning(device)?;
-    }
-
-    let created_partitions = create_partition_table(destination.path(), size, layout)?;
+    let created_partitions = create_partition_table(destination, size, layout)?;
 
     write_images(destination, created_partitions)?;
 
@@ -65,12 +67,40 @@ fn open_read_write(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).write(true).open(path)
 }
 
-fn create_protective_mbr(path: &Path, device_size: u64) -> Result<(), String> {
+/// A protective MBR, with an active hybrid entry for the partition that is legacy BIOS bootable.
+fn mbr(device_size: u64, partitions: &[CreatedPartition]) -> Result<ProtectiveMBR, String> {
+    let mut mbr = ProtectiveMBR::with_lb_size(
+        u32::try_from((device_size / LBA_SIZE) - 1).unwrap_or(0xFF_FF_FF_FF));
+    let bootable = partitions.iter().find(|created| created.def.attributes.legacy_bios_bootable);
+    if let Some(created) = bootable {
+        mbr.set_partition(MBR_HYBRID_ENTRY, hybrid_entry(&created.partition)?);
+    }
+    Ok(mbr)
+}
+
+fn hybrid_entry(partition: &Partition) -> Result<PartRecord, String> {
+    let sectors = u32::try_from(partition.first_lba).ok()
+        .zip(u32::try_from(partition.last_lba).ok())
+        .and_then(|(first, last)| Some((first, (last - first).checked_add(1)?)));
+    let Some((lb_start, lb_size)) = sectors else {
+        return Err(format!(
+            "Partition {} (sectors {} to {}) does not fit an MBR entry, which addresses the sectors up to {}. \
+            Place the legacy BIOS bootable partition before that sector.",
+            partition.name, partition.first_lba, partition.last_lba, u32::MAX
+        ))
+    };
+    Ok(PartRecord {
+        boot_indicator: MBR_BOOT_INDICATOR_ACTIVE,
+        os_type: MBR_OS_TYPE_LINUX,
+        lb_start,
+        lb_size,
+        ..PartRecord::zero()
+    })
+}
+
+fn write_mbr(path: &Path, mbr: &ProtectiveMBR) -> Result<(), String> {
     let mut file = open_read_write(path)
         .map_err(|err| format!("Could not open file: {err}"))?;
-
-    let mbr = gpt::mbr::ProtectiveMBR::with_lb_size(
-        u32::try_from((device_size / LBA_SIZE) - 1).unwrap_or(0xFF_FF_FF_FF));
     mbr.overwrite_lba0(&mut file)
         .map_err(|err| format!("Failed to write MBR to {}: {}", path.display(), err))?;
 
@@ -78,12 +108,14 @@ fn create_protective_mbr(path: &Path, device_size: u64) -> Result<(), String> {
 }
 
 fn create_partition_table(
-    destination: &Path,
+    destination: &Destination,
     size: u64,
     layout: &Layout,
 ) -> Result<Vec<CreatedPartition>, String> {
-    eprintln!("Opening {}…", destination.display());
-    let (disk, created_partitions) = lay_out_partitions(destination, layout)?;
+    let path = destination.path();
+    eprintln!("Opening {}…", path.display());
+    let (disk, created_partitions) = lay_out_partitions(path, layout)?;
+    let mbr = mbr(size, &created_partitions)?;
 
     for created in &created_partitions {
         eprintln!(
@@ -93,8 +125,12 @@ fn create_partition_table(
         );
     }
 
-    eprintln!("Creating protective MBR…");
-    create_protective_mbr(destination, size)?;
+    if let Destination::BlockDevice(device) = destination {
+        erase_beginning(device)?;
+    }
+
+    eprintln!("Creating MBR…");
+    write_mbr(path, &mbr)?;
 
     eprintln!("Writing partition table…");
     disk.write().map_err(|err| format!("Failed to write partition table: {err}"))?;
@@ -106,7 +142,7 @@ fn lay_out_partitions(
     destination: &Path,
     layout: &Layout,
 ) -> Result<(GptDisk<File>, Vec<CreatedPartition>), String> {
-    let mut disk = new_partition_table(destination)?;
+    let mut disk = new_partition_table(destination, layout.disk_guid)?;
     let created_partitions = layout.place(usable_bytes(disk.header()))?.into_iter()
         .map(|placement| add_partition(&mut disk, placement))
         .collect::<Result<Vec<_>, String>>()?;
@@ -114,14 +150,14 @@ fn lay_out_partitions(
     Ok((disk, created_partitions))
 }
 
-fn new_partition_table(destination: &Path) -> Result<GptDisk<File>, String> {
+fn new_partition_table(destination: &Path, disk_guid: Option<Uuid>) -> Result<GptDisk<File>, String> {
     let cfg = gpt::GptConfig::new()
         .writable(true)
         .logical_block_size(LBA);
 
     open_read_write(destination)
         .map_err(gpt::GptError::from)
-        .and_then(|file| cfg.create_from_device(file, None))
+        .and_then(|file| cfg.create_from_device(file, disk_guid))
         .map_err(|err| format!(
             "Failed to open file {} for creating a partition table: {}",
             destination.display(), err
@@ -146,7 +182,7 @@ fn add_partition(disk: &mut GptDisk<File>, placement: Placement) -> Result<Creat
         sectors.start,
         sectors.end - sectors.start,
         def.part_type.clone(),
-        0,
+        PartitionAttributes::from(def.attributes).bits(),
     ).map_err(|err| format!(
         "Could not add partition {}, size {}: {}",
         def.partition_name, BinarySize::from(def.size).rounded(), err
@@ -166,8 +202,17 @@ fn add_partition(disk: &mut GptDisk<File>, placement: Placement) -> Result<Creat
     Ok(CreatedPartition { def, partition })
 }
 
+impl From<GptAttributes> for PartitionAttributes {
+    fn from(attributes: GptAttributes) -> Self {
+        let mut flags = Self::empty();
+        flags.set(Self::PLATFORM, attributes.required);
+        flags.set(Self::BOOTABLE, attributes.legacy_bios_bootable);
+        flags
+    }
+}
+
 fn create_fitted_image(path: &Path, layout: &Layout) -> Result<u64, String> {
-    let upper_bound = layout.idbloader.iter().chain(&layout.partitions)
+    let upper_bound = layout.definitions()
         .map(|def| def.size + FIRST_PART_ALIGNMENT)
         .sum::<u64>() + FIRST_PART_ALIGNMENT;
     create_sparse_file(path, upper_bound)
@@ -181,7 +226,7 @@ fn create_fitted_image(path: &Path, layout: &Layout) -> Result<u64, String> {
 }
 
 fn fitted_size(path: &Path, layout: &Layout) -> Result<u64, String> {
-    let disk = new_partition_table(path)?;
+    let disk = new_partition_table(path, layout.disk_guid)?;
     let header = disk.header();
     let usable = usable_bytes(header);
     let partitions_end = layout.place(usable.clone())?.iter()
@@ -252,7 +297,7 @@ fn write_images(
                 partition.partition.name, partition_start, err
             ))?;
 
-        if let Some(source_file) = &partition.def.source_file {
+        if let Some(source) = &partition.def.source {
             file.seek(SeekFrom::Start(partition_start))
                 .map_err(|err| format!(
                     "Could not seek to start of partition {}: {}",
@@ -264,18 +309,25 @@ fn write_images(
                 partition.partition.name, BinarySize::from(partition.def.size).rounded()
             );
 
-            let mut input_file = OpenOptions::new().read(true).open(source_file.clone())
+            let input_file = OpenOptions::new().read(true).open(&source.path)
                 .map_err(|err| format!(
                     "Could not open source file {} to write to {}: {}",
-                    source_file.display(), partition.partition.name, err
+                    source.path.display(), partition.partition.name, err
                 ))?;
 
-            let bytes_copied = copy(&mut input_file, &mut file)
+            let bytes_copied = copy(&mut input_file.take(source.len), &mut file)
                 .map_err(|err| format!(
                     "Failed to write image {} to {} on {}: {}",
-                    source_file.display(), partition.partition.name,
+                    source.path.display(), partition.partition.name,
                     path.display(), err
                 ))?;
+            if bytes_copied != source.len {
+                return Err(format!(
+                    "Source file {} for partition {} ended after {} of its {} bytes while it was written. \
+                    Leave the source files unchanged while rockflasher runs.",
+                    source.path.display(), partition.partition.name, bytes_copied, source.len
+                ))
+            }
 
             let remaining_bytes = partition.partition.bytes_len(LBA)
                 .map_err(|err| format!(
@@ -369,6 +421,76 @@ mod tests {
     }
 
     #[test]
+    fn image_file_takes_the_given_disk_guid() {
+        let scratch = ScratchDir::new("disk-guid");
+        let guid = "5452574f-2211-4433-5566-778899aabb00";
+        let disk = flash_fitted_image(&scratch, &["--blank-partition", "a:1MiB", "--disk-uuid", guid, "--no-fill"]);
+        assert_eq!(*disk.guid(), guid.parse::<Uuid>().unwrap());
+        assert_eq!(disk.backup_header().unwrap().disk_guid, *disk.guid());
+    }
+
+    #[test]
+    fn partition_attributes_are_written_to_the_gpt() {
+        let scratch = ScratchDir::new("disk-attributes");
+        let image = scratch.path().join("disk.img");
+        let mut layout = layout(&[
+            "--blank-partition", "a:1MiB",
+            "--blank-partition", "b:1MiB",
+            "--blank-partition", "c:1MiB",
+            "--no-fill",
+        ]).unwrap();
+        layout.partitions[1].attributes = GptAttributes { required: true, legacy_bios_bootable: true };
+        layout.partitions[2].attributes = GptAttributes { required: true, legacy_bios_bootable: false };
+
+        flash(&Destination::ImageFile { path: image.clone(), size: None }, &layout).unwrap();
+
+        let disk = gpt::GptConfig::new().logical_block_size(LBA).open(&image).unwrap();
+        let flags: Vec<_> = disk.partitions().values().map(|partition| (partition.name.as_str(), partition.flags)).collect();
+        let required = PartitionAttributes::PLATFORM.bits();
+        let legacy_bios_bootable = PartitionAttributes::BOOTABLE.bits();
+        assert_eq!(flags, [("a", 0), ("b", required | legacy_bios_bootable), ("c", required)]);
+    }
+
+    #[test]
+    fn legacy_bios_bootable_partition_gets_the_active_mbr_entry_after_the_protective_one() {
+        let scratch = ScratchDir::new("disk-mbr");
+        let image = scratch.path().join("disk.img");
+        let mut layout = layout(&["--blank-partition", "a:1MiB", "--blank-partition", "b:1MiB", "--no-fill"]).unwrap();
+        layout.partitions[1].attributes.legacy_bios_bootable = true;
+
+        flash(&Destination::ImageFile { path: image.clone(), size: None }, &layout).unwrap();
+
+        let disk = gpt::GptConfig::new().logical_block_size(LBA).open(&image).unwrap();
+        let bootable = disk.partitions().values().find(|partition| partition.name == "b").unwrap();
+        let image_sectors = disk.header().backup_lba + 1;
+        let mbr = ProtectiveMBR::from_disk(&mut File::open(&image).unwrap(), LBA).unwrap();
+        let entry = |index| mbr.partition(index)
+            .map(|record| (record.boot_indicator, record.os_type, u64::from(record.lb_start), u64::from(record.lb_size)));
+        assert_eq!(entry(0), Some((0, 0xEE, 1, image_sectors - 1)));
+        assert_eq!(entry(MBR_HYBRID_ENTRY), Some((
+            MBR_BOOT_INDICATOR_ACTIVE, MBR_OS_TYPE_LINUX,
+            bootable.first_lba, bootable.last_lba - bootable.first_lba + 1,
+        )));
+        assert_eq!(mbr.partition(MBR_HYBRID_ENTRY + 1), Some(PartRecord::zero()));
+    }
+
+    #[test]
+    fn hybrid_entry_addresses_the_sectors_up_to_the_mbr_limit() {
+        let partition = |last_lba| Partition {
+            part_type_guid: gpt::partition_types::LINUX_FS,
+            part_guid: Uuid::nil(),
+            first_lba: 34,
+            last_lba,
+            flags: 0,
+            name: "boot".into(),
+        };
+        let last_mbr_sector = u64::from(u32::MAX);
+        assert_eq!(hybrid_entry(&partition(last_mbr_sector)).map(|record| record.lb_size), Ok(u32::MAX - 33));
+        let err = hybrid_entry(&partition(last_mbr_sector + 1)).err().unwrap();
+        assert!(err.contains("does not fit an MBR entry"), "{err}");
+    }
+
+    #[test]
     fn image_file_that_does_not_fit_is_removed() {
         let scratch = ScratchDir::new("disk-fitted-removed");
         let image = scratch.path().join("disk.img");
@@ -419,6 +541,34 @@ mod tests {
             assert!(written == source, "contents of {name}");
             assert!(rest.iter().all(|&byte| byte == 0), "zeros after the contents of {name}");
         }
+    }
+
+    #[test]
+    fn flash_writes_a_source_up_to_its_length_when_the_layout_was_built() {
+        let scratch = ScratchDir::new("disk-source-length");
+        let source = scratch.patterned_file("a.img", 4096, 1);
+        let image = scratch.path().join("disk.img");
+        let mut layout = layout(&["--partition", &format!("a:{}", source.display()), "--no-fill"]).unwrap();
+        layout.partitions[0].source.as_mut().unwrap().len = 1024;
+
+        flash(&Destination::ImageFile { path: image.clone(), size: None }, &layout).unwrap();
+
+        let disk = gpt::GptConfig::new().logical_block_size(LBA).open(&image).unwrap();
+        let start = usize::try_from(disk.partitions().values().next().unwrap().first_lba * LBA_SIZE).unwrap();
+        let contents = std::fs::read(&image).unwrap();
+        assert_eq!(contents[start..start + 1024], std::fs::read(&source).unwrap()[..1024]);
+        assert!(contents[start + 1024..start + 4096].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn source_that_ends_before_its_length_is_refused() {
+        let scratch = ScratchDir::new("disk-source-short");
+        let source = scratch.file("a.img", 4096);
+        let image = scratch.path().join("disk.img");
+        let mut layout = layout(&["--partition", &format!("a:{}", source.display()), "--no-fill"]).unwrap();
+        layout.partitions[0].source.as_mut().unwrap().len = 8192;
+        let err = flash(&Destination::ImageFile { path: image, size: None }, &layout).err().unwrap();
+        assert!(err.contains("ended after 4096 of its 8192 bytes"), "{err}");
     }
 
     #[test]

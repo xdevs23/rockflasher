@@ -1,9 +1,9 @@
-use std::fs::{metadata, File};
+use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer};
 use uuid::Uuid;
-use crate::layout::PartitionDefinition;
+use crate::layout::{PartitionDefinition, SourceFile};
 use crate::values::PartitionType;
 
 #[derive(Deserialize)]
@@ -19,29 +19,18 @@ struct RepartPartition {
 
 impl RepartPartition {
     fn into_definition(self, directory: &Path) -> Result<PartitionDefinition, String> {
-        let split_file = self.split_path.as_deref().map(|split_path| directory.join(split_path));
-        if let Some(split_file) = &split_file {
-            self.check_split_file(split_file)?;
-        }
-        Ok(PartitionDefinition::new(&self.label, split_file, self.raw_size, self.part_type.0, Some(self.uuid)))
+        let source = self.split_path.as_deref()
+            .map(|split_path| self.split_file(&directory.join(split_path)))
+            .transpose()?;
+        Ok(PartitionDefinition::new(&self.label, source, self.raw_size, self.part_type.0, Some(self.uuid)))
     }
 
-    fn check_split_file(&self, split_file: &Path) -> Result<(), String> {
-        let length = metadata(split_file)
-            .map_err(|err| format!(
-                "Could not read split file {} of partition {}: {}. \
-                Pass the output of the systemd-repart run that wrote the split files.",
-                split_file.display(), self.label, err
-            ))?
-            .len();
-        if length > self.raw_size {
-            return Err(format!(
-                "Split file {} ({} bytes) is larger than partition {} ({} bytes). \
-                Pass the output of the systemd-repart run that wrote the split files.",
-                split_file.display(), length, self.label, self.raw_size
-            ))
-        }
-        Ok(())
+    fn split_file(&self, path: &Path) -> Result<SourceFile, String> {
+        SourceFile::stat(path).map_err(|err| format!(
+            "Could not read split file {} for partition {}: {}. \
+            Pass the output of the systemd-repart run that wrote the split files.",
+            path.display(), self.label, err
+        ))
     }
 }
 
@@ -107,7 +96,7 @@ mod tests {
         let partitions = read_partitions(&path).unwrap();
 
         let fields: Vec<_> = partitions.iter()
-            .map(|def| (def.partition_name.as_str(), def.part_type.guid, def.part_guid, def.size, def.source_file.clone()))
+            .map(|def| (def.partition_name.as_str(), def.part_type.guid, def.part_guid, def.size, def.source.as_ref().map(|source| source.path.clone())))
             .collect();
         let uuid = |text: &str| text.parse::<Uuid>().unwrap();
         assert_eq!(fields, [
@@ -122,14 +111,6 @@ mod tests {
         let scratch = ScratchDir::new("repart-unknown-type");
         let path = write_output(&scratch, &[partition("var", "var", MAIN_UUID, 4096, "-")]);
         assert!(read_partitions(&path).unwrap_err().contains("Partition type var is not supported"));
-    }
-
-    #[test]
-    fn split_file_larger_than_the_partition_is_refused() {
-        let scratch = ScratchDir::new("repart-large-split");
-        scratch.file("disk.img.esp", 8192);
-        let path = write_output(&scratch, &[partition("esp", "ESP", ESP_UUID, 4096, "disk.img.esp")]);
-        assert!(read_partitions(&path).unwrap_err().contains("is larger than partition ESP"));
     }
 
     #[test]
