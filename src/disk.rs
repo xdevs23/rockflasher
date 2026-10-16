@@ -6,6 +6,7 @@ use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::Path;
 use gpt::GptDisk;
 use gpt::header::Header;
+use gpt::mbr::{PartRecord, ProtectiveMBR};
 use gpt::partition::{Partition, PartitionAttributes};
 use sizes::BinarySize;
 use uuid::Uuid;
@@ -14,6 +15,10 @@ use crate::layout::{GptAttributes, Layout, PartitionDefinition, Placement, FIRST
 use crate::values::ByteSize;
 
 const CLEAR_BYTES: [u8; 1024] = [0; 1024];
+const MBR_BOOT_INDICATOR_ACTIVE: u8 = 0x80;
+const MBR_OS_TYPE_LINUX: u8 = 0x83;
+// The entry after the protective one, which spans the whole disk, so the two entries overlap.
+const MBR_HYBRID_ENTRY: usize = 1;
 
 #[derive(Clone, Debug)]
 struct CreatedPartition {
@@ -62,12 +67,40 @@ fn open_read_write(path: &Path) -> io::Result<File> {
     OpenOptions::new().read(true).write(true).open(path)
 }
 
-fn create_protective_mbr(path: &Path, device_size: u64) -> Result<(), String> {
+/// A protective MBR, with an active hybrid entry for the partition that is legacy BIOS bootable.
+fn mbr(device_size: u64, partitions: &[CreatedPartition]) -> Result<ProtectiveMBR, String> {
+    let mut mbr = ProtectiveMBR::with_lb_size(
+        u32::try_from((device_size / LBA_SIZE) - 1).unwrap_or(0xFF_FF_FF_FF));
+    let bootable = partitions.iter().find(|created| created.def.attributes.legacy_bios_bootable);
+    if let Some(created) = bootable {
+        mbr.set_partition(MBR_HYBRID_ENTRY, hybrid_entry(&created.partition)?);
+    }
+    Ok(mbr)
+}
+
+fn hybrid_entry(partition: &Partition) -> Result<PartRecord, String> {
+    let sectors = u32::try_from(partition.first_lba).ok()
+        .zip(u32::try_from(partition.last_lba).ok())
+        .and_then(|(first, last)| Some((first, (last - first).checked_add(1)?)));
+    let Some((lb_start, lb_size)) = sectors else {
+        return Err(format!(
+            "Partition {} (sectors {} to {}) does not fit an MBR entry, which addresses the sectors up to {}. \
+            Place the legacy BIOS bootable partition before that sector.",
+            partition.name, partition.first_lba, partition.last_lba, u32::MAX
+        ))
+    };
+    Ok(PartRecord {
+        boot_indicator: MBR_BOOT_INDICATOR_ACTIVE,
+        os_type: MBR_OS_TYPE_LINUX,
+        lb_start,
+        lb_size,
+        ..PartRecord::zero()
+    })
+}
+
+fn write_mbr(path: &Path, mbr: &ProtectiveMBR) -> Result<(), String> {
     let mut file = open_read_write(path)
         .map_err(|err| format!("Could not open file: {err}"))?;
-
-    let mbr = gpt::mbr::ProtectiveMBR::with_lb_size(
-        u32::try_from((device_size / LBA_SIZE) - 1).unwrap_or(0xFF_FF_FF_FF));
     mbr.overwrite_lba0(&mut file)
         .map_err(|err| format!("Failed to write MBR to {}: {}", path.display(), err))?;
 
@@ -82,6 +115,7 @@ fn create_partition_table(
     let path = destination.path();
     eprintln!("Opening {}…", path.display());
     let (disk, created_partitions) = lay_out_partitions(path, layout)?;
+    let mbr = mbr(size, &created_partitions)?;
 
     for created in &created_partitions {
         eprintln!(
@@ -95,8 +129,8 @@ fn create_partition_table(
         erase_beginning(device)?;
     }
 
-    eprintln!("Creating protective MBR…");
-    create_protective_mbr(path, size)?;
+    eprintln!("Creating MBR…");
+    write_mbr(path, &mbr)?;
 
     eprintln!("Writing partition table…");
     disk.write().map_err(|err| format!("Failed to write partition table: {err}"))?;
@@ -415,6 +449,45 @@ mod tests {
         let required = PartitionAttributes::PLATFORM.bits();
         let legacy_bios_bootable = PartitionAttributes::BOOTABLE.bits();
         assert_eq!(flags, [("a", 0), ("b", required | legacy_bios_bootable), ("c", required)]);
+    }
+
+    #[test]
+    fn legacy_bios_bootable_partition_gets_the_active_mbr_entry_after_the_protective_one() {
+        let scratch = ScratchDir::new("disk-mbr");
+        let image = scratch.path().join("disk.img");
+        let mut layout = layout(&["--blank-partition", "a:1MiB", "--blank-partition", "b:1MiB", "--no-fill"]).unwrap();
+        layout.partitions[1].attributes.legacy_bios_bootable = true;
+
+        flash(&Destination::ImageFile { path: image.clone(), size: None }, &layout).unwrap();
+
+        let disk = gpt::GptConfig::new().logical_block_size(LBA).open(&image).unwrap();
+        let bootable = disk.partitions().values().find(|partition| partition.name == "b").unwrap();
+        let image_sectors = disk.header().backup_lba + 1;
+        let mbr = ProtectiveMBR::from_disk(&mut File::open(&image).unwrap(), LBA).unwrap();
+        let entry = |index| mbr.partition(index)
+            .map(|record| (record.boot_indicator, record.os_type, u64::from(record.lb_start), u64::from(record.lb_size)));
+        assert_eq!(entry(0), Some((0, 0xEE, 1, image_sectors - 1)));
+        assert_eq!(entry(MBR_HYBRID_ENTRY), Some((
+            MBR_BOOT_INDICATOR_ACTIVE, MBR_OS_TYPE_LINUX,
+            bootable.first_lba, bootable.last_lba - bootable.first_lba + 1,
+        )));
+        assert_eq!(mbr.partition(MBR_HYBRID_ENTRY + 1), Some(PartRecord::zero()));
+    }
+
+    #[test]
+    fn hybrid_entry_addresses_the_sectors_up_to_the_mbr_limit() {
+        let partition = |last_lba| Partition {
+            part_type_guid: gpt::partition_types::LINUX_FS,
+            part_guid: Uuid::nil(),
+            first_lba: 34,
+            last_lba,
+            flags: 0,
+            name: "boot".into(),
+        };
+        let last_mbr_sector = u64::from(u32::MAX);
+        assert_eq!(hybrid_entry(&partition(last_mbr_sector)).map(|record| record.lb_size), Ok(u32::MAX - 33));
+        let err = hybrid_entry(&partition(last_mbr_sector + 1)).err().unwrap();
+        assert!(err.contains("does not fit an MBR entry"), "{err}");
     }
 
     #[test]
