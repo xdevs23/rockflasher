@@ -253,7 +253,7 @@ fn write_images(
                 partition.partition.name, partition_start, err
             ))?;
 
-        if let Some(source_file) = &partition.def.source_file {
+        if let Some(source) = &partition.def.source {
             file.seek(SeekFrom::Start(partition_start))
                 .map_err(|err| format!(
                     "Could not seek to start of partition {}: {}",
@@ -265,18 +265,25 @@ fn write_images(
                 partition.partition.name, BinarySize::from(partition.def.size).rounded()
             );
 
-            let mut input_file = OpenOptions::new().read(true).open(source_file.clone())
+            let input_file = OpenOptions::new().read(true).open(&source.path)
                 .map_err(|err| format!(
                     "Could not open source file {} to write to {}: {}",
-                    source_file.display(), partition.partition.name, err
+                    source.path.display(), partition.partition.name, err
                 ))?;
 
-            let bytes_copied = copy(&mut input_file, &mut file)
+            let bytes_copied = copy(&mut input_file.take(source.len), &mut file)
                 .map_err(|err| format!(
                     "Failed to write image {} to {} on {}: {}",
-                    source_file.display(), partition.partition.name,
+                    source.path.display(), partition.partition.name,
                     path.display(), err
                 ))?;
+            if bytes_copied != source.len {
+                return Err(format!(
+                    "Source file {} for partition {} ended after {} of its {} bytes while it was written. \
+                    Leave the source files unchanged while rockflasher runs.",
+                    source.path.display(), partition.partition.name, bytes_copied, source.len
+                ))
+            }
 
             let remaining_bytes = partition.partition.bytes_len(LBA)
                 .map_err(|err| format!(
@@ -420,6 +427,34 @@ mod tests {
             assert!(written == source, "contents of {name}");
             assert!(rest.iter().all(|&byte| byte == 0), "zeros after the contents of {name}");
         }
+    }
+
+    #[test]
+    fn flash_writes_a_source_up_to_its_length_when_the_layout_was_built() {
+        let scratch = ScratchDir::new("disk-source-length");
+        let source = scratch.patterned_file("a.img", 4096, 1);
+        let image = scratch.path().join("disk.img");
+        let mut layout = layout(&["--partition", &format!("a:{}", source.display()), "--no-fill"]).unwrap();
+        layout.partitions[0].source.as_mut().unwrap().len = 1024;
+
+        flash(&Destination::ImageFile { path: image.clone(), size: None }, &layout).unwrap();
+
+        let disk = gpt::GptConfig::new().logical_block_size(LBA).open(&image).unwrap();
+        let start = usize::try_from(disk.partitions().values().next().unwrap().first_lba * LBA_SIZE).unwrap();
+        let contents = std::fs::read(&image).unwrap();
+        assert_eq!(contents[start..start + 1024], std::fs::read(&source).unwrap()[..1024]);
+        assert!(contents[start + 1024..start + 4096].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn source_that_ends_before_its_length_is_refused() {
+        let scratch = ScratchDir::new("disk-source-short");
+        let source = scratch.file("a.img", 4096);
+        let image = scratch.path().join("disk.img");
+        let mut layout = layout(&["--partition", &format!("a:{}", source.display()), "--no-fill"]).unwrap();
+        layout.partitions[0].source.as_mut().unwrap().len = 8192;
+        let err = flash(&Destination::ImageFile { path: image, size: None }, &layout).err().unwrap();
+        assert!(err.contains("ended after 4096 of its 8192 bytes"), "{err}");
     }
 
     #[test]
