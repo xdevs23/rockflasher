@@ -21,6 +21,10 @@ pub struct Args {
     #[arg(long)]
     pub partition_uuid: Vec<PartitionSetting<Uuid>>,
 
+    /// Set the disk GUID of the partition table. Without it, the disk GUID is random
+    #[arg(long)]
+    pub disk_uuid: Option<Uuid>,
+
     /// Add an empty partition (name:size)
     #[arg(short, long)]
     pub blank_partition: Vec<PartitionSetting<ByteSize>>,
@@ -58,6 +62,7 @@ impl Args {
             repart_partitions: self.repart.as_deref().map_or(Ok(Vec::new()), repart::read_partitions)?,
             types: self.partition_type.clone(),
             uuids: self.partition_uuid.clone(),
+            disk_guid: self.disk_uuid,
             fill_userdata: !self.no_fill,
         })
     }

@@ -130,6 +130,7 @@ pub struct LayoutRequest {
     pub repart_partitions: Vec<PartitionDefinition>,
     pub types: Vec<PartitionSetting<PartitionType>>,
     pub uuids: Vec<PartitionSetting<Uuid>>,
+    pub disk_guid: Option<Uuid>,
     pub fill_userdata: bool,
 }
 
@@ -137,6 +138,7 @@ pub struct Layout {
     /// Partitions at the places where the boot chain of a board reads them, in the order of their starts.
     pub board_partitions: Vec<Placement>,
     pub partitions: Vec<PartitionDefinition>,
+    pub disk_guid: Option<Uuid>,
     pub fill_userdata: bool,
 }
 
@@ -179,7 +181,12 @@ impl Layout {
             .collect();
 
         let fill_userdata = request.fill_userdata && !partitions.iter().any(|def| def.role() == Role::Userdata);
-        let layout = Self { board_partitions, partitions: loaders_first(partitions), fill_userdata };
+        let layout = Self {
+            board_partitions,
+            partitions: loaders_first(partitions),
+            disk_guid: request.disk_guid,
+            fill_userdata,
+        };
         layout.check(settings)?;
         Ok(layout)
     }
@@ -189,7 +196,7 @@ impl Layout {
         check_partition_names(&definitions)?;
         check_settings("type", settings.types, &definitions)?;
         check_settings("UUID", settings.uuids, &definitions)?;
-        check_partition_uuids(&definitions)?;
+        check_uuids(self.disk_guid, &definitions)?;
         check_source_files(&definitions)?;
         check_partition_sizes(&definitions)
     }
@@ -282,9 +289,15 @@ fn check_partition_names(partitions: &[&PartitionDefinition]) -> Result<(), Stri
     Ok(())
 }
 
-fn check_partition_uuids(partitions: &[&PartitionDefinition]) -> Result<(), String> {
+fn check_uuids(disk_guid: Option<Uuid>, partitions: &[&PartitionDefinition]) -> Result<(), String> {
     for (index, def) in partitions.iter().enumerate() {
         let Some(part_guid) = def.part_guid else { continue };
+        if disk_guid == Some(part_guid) {
+            return Err(format!(
+                "Partition {} has the UUID {} of the disk. Give the disk and each partition its own UUID.",
+                def.partition_name, part_guid
+            ))
+        }
         if let Some(earlier) = partitions[..index].iter().find(|earlier| earlier.part_guid == Some(part_guid)) {
             return Err(format!(
                 "Partitions {} and {} have the same UUID {}. Give each partition its own UUID.",
@@ -494,6 +507,16 @@ mod tests {
             "--partition-uuid", &format!("b:{UUID}"),
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn partition_uuid_equal_to_the_disk_uuid_is_refused() {
+        let err = layout(&[
+            "--blank-partition", "a:1MiB",
+            "--disk-uuid", UUID,
+            "--partition-uuid", &format!("a:{UUID}"),
+        ]).err().unwrap();
+        assert!(err.contains("Partition a has the UUID"), "{err}");
     }
 
     #[test]

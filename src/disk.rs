@@ -8,6 +8,7 @@ use gpt::GptDisk;
 use gpt::header::Header;
 use gpt::partition::Partition;
 use sizes::BinarySize;
+use uuid::Uuid;
 use crate::destination::Destination;
 use crate::layout::{Layout, PartitionDefinition, Placement, FIRST_PART_ALIGNMENT, LBA, LBA_SIZE};
 use crate::values::ByteSize;
@@ -107,7 +108,7 @@ fn lay_out_partitions(
     destination: &Path,
     layout: &Layout,
 ) -> Result<(GptDisk<File>, Vec<CreatedPartition>), String> {
-    let mut disk = new_partition_table(destination)?;
+    let mut disk = new_partition_table(destination, layout.disk_guid)?;
     let created_partitions = layout.place(usable_bytes(disk.header()))?.into_iter()
         .map(|placement| add_partition(&mut disk, placement))
         .collect::<Result<Vec<_>, String>>()?;
@@ -115,14 +116,14 @@ fn lay_out_partitions(
     Ok((disk, created_partitions))
 }
 
-fn new_partition_table(destination: &Path) -> Result<GptDisk<File>, String> {
+fn new_partition_table(destination: &Path, disk_guid: Option<Uuid>) -> Result<GptDisk<File>, String> {
     let cfg = gpt::GptConfig::new()
         .writable(true)
         .logical_block_size(LBA);
 
     open_read_write(destination)
         .map_err(gpt::GptError::from)
-        .and_then(|file| cfg.create_from_device(file, None))
+        .and_then(|file| cfg.create_from_device(file, disk_guid))
         .map_err(|err| format!(
             "Failed to open file {} for creating a partition table: {}",
             destination.display(), err
@@ -182,7 +183,7 @@ fn create_fitted_image(path: &Path, layout: &Layout) -> Result<u64, String> {
 }
 
 fn fitted_size(path: &Path, layout: &Layout) -> Result<u64, String> {
-    let disk = new_partition_table(path)?;
+    let disk = new_partition_table(path, layout.disk_guid)?;
     let header = disk.header();
     let usable = usable_bytes(header);
     let partitions_end = layout.place(usable.clone())?.iter()
@@ -374,6 +375,15 @@ mod tests {
         assert_eq!(start_of("idbloader"), Some(32 * 1024));
         assert_eq!(start_of("uboot"), Some(8 * 1024 * 1024));
         assert_eq!(start_of("main"), Some(16 * 1024 * 1024));
+    }
+
+    #[test]
+    fn image_file_takes_the_given_disk_guid() {
+        let scratch = ScratchDir::new("disk-guid");
+        let guid = "5452574f-2211-4433-5566-778899aabb00";
+        let disk = flash_fitted_image(&scratch, &["--blank-partition", "a:1MiB", "--disk-uuid", guid, "--no-fill"]);
+        assert_eq!(*disk.guid(), guid.parse::<Uuid>().unwrap());
+        assert_eq!(disk.backup_header().unwrap().disk_guid, *disk.guid());
     }
 
     #[test]

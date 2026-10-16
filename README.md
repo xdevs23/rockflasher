@@ -82,6 +82,7 @@ Every other partition starts at the end of the partition before it, rounded up t
 The partition name is the GPT partition name.
 `--partition-type name:type` sets the GPT type: `linux`, a systemd-repart type name (`esp`, `xbootldr`, `linux-generic`, `swap`, `home`, `srv`, `root-x86`, `root-x86-64`, `root-arm`, `root-arm64`), a type name of the gpt crate (such as `linux_fs`) or a type GUID.
 `--partition-uuid name:uuid` sets the partition UUID.
+`--disk-uuid uuid` sets the disk GUID. With it, `--no-fill` and a `--partition-uuid` for every partition, the same inputs give the same image file.
 
 `--no-fill` leaves the space after the last partition free. Without it, a userdata partition fills that space.
 With `--no-fill`, an image file as `--destination` needs no `--size`: it gets the size of its partitions.
