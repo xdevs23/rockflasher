@@ -93,7 +93,7 @@ sudo target/release/rockflasher \
 A card is written for one board, so `--idbloader` and `--bl2` exclude each other.
 On a Rockchip board, the idbloader is written to a partition named `idbloader` at sector 64 (32 KiB).
 On a MediaTek MT7988 board, BL2 is written to a partition named `bl2` from sector 34 (17 KiB) to 4 MiB.
-That partition has the GPT attributes required and legacy BIOS bootable, and it is the active partition in the MBR.
+That partition has the GPT attributes required and legacy BIOS bootable.
 The FIP is written to a partition named `fip` at 4 MiB, where BL2 finds it by its name.
 
 The first partition from `--partition`, `--blank-partition` or `--repart` starts at the first 8 MiB boundary after the board partitions, and loader partitions (`uboot`, `bootloader`, `loader`, `trust`) come first, so `--partition uboot:u-boot.itb` places U-Boot at 8 MiB.
