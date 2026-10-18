@@ -210,7 +210,6 @@ impl Layout {
         check_settings("UUID", settings.uuids, &definitions)?;
         check_uuids(self.disk_guid, &definitions)?;
         check_source_files(&definitions)?;
-        check_legacy_bios_bootable(&definitions)?;
         check_partition_sizes(&definitions)
     }
 
@@ -339,18 +338,6 @@ fn check_source_files(partitions: &[&PartitionDefinition]) -> Result<(), String>
         }
     }
     Ok(())
-}
-
-fn check_legacy_bios_bootable(partitions: &[&PartitionDefinition]) -> Result<(), String> {
-    let mut bootable = partitions.iter().filter(|def| def.attributes.legacy_bios_bootable);
-    match (bootable.next(), bootable.next()) {
-        (Some(first), Some(second)) => Err(format!(
-            "Partitions {} and {} are both legacy BIOS bootable, and the MBR marks one partition active. \
-            Mark one of them.",
-            first.partition_name, second.partition_name
-        )),
-        _ => Ok(()),
-    }
 }
 
 fn check_partition_sizes(partitions: &[&PartitionDefinition]) -> Result<(), String> {
@@ -581,17 +568,5 @@ mod tests {
         std::fs::write(&repart, serde_json::Value::from([esp]).to_string()).unwrap();
         let err = layout(&["--repart", &repart.display().to_string()]).err().unwrap();
         assert!(err.contains("(8192 bytes) is larger than partition ESP (4096 bytes)"), "{err}");
-    }
-
-    #[test]
-    fn two_legacy_bios_bootable_partitions_are_refused() {
-        let mut layout = layout(&["--blank-partition", "a:1MiB", "--blank-partition", "b:1MiB"]).unwrap();
-        let settings = Settings { types: &[], uuids: &[] };
-        assert!(layout.check(settings).is_ok());
-        for def in &mut layout.partitions {
-            def.attributes.legacy_bios_bootable = true;
-        }
-        let err = layout.check(settings).err().unwrap();
-        assert!(err.contains("Partitions a and b are both legacy BIOS bootable"), "{err}");
     }
 }
